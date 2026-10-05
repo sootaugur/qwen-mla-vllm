@@ -172,6 +172,13 @@ def register():
     from vllm import ModelRegistry
 
     print(f"[qwen-mla] register() called in pid {os.getpid()}", file=sys.stderr, flush=True)
+    # flashinfer JIT-compiles kernels at startup (vLLM's own sampler included) by running the `ninja`
+    # EXECUTABLE that pip installs into the environment's bin/. When the server is started as
+    # .venv/bin/vllm without activating the venv, that directory is not on PATH and the engine dies with
+    # FileNotFoundError: 'ninja'. register() runs first in every vLLM process, so fix PATH here.
+    _bindir = os.path.dirname(sys.executable)
+    if _bindir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = _bindir + os.pathsep + os.environ.get("PATH", "")
     _alias_legacy_env()
     # QWEN_MLA_GLA_SHARD=0 (keep the full latent on every rank, for A/B) changes tensor shapes, but vLLM's
     # torch.compile cache key does not include plugin env vars: a graph compiled for the sharded
