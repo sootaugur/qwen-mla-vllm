@@ -55,6 +55,31 @@ from .ops.mla_gather import gather_cache_torch
 from .prefill_align import patch_prefill_backend
 
 
+def splitk_cap(batch: int, heads: int, lse_dim: int, splits: int) -> int:
+    """Largest split count <= `splits` whose fp32 split-K scratch fits QWEN_MLA_SPLITK_SCRATCH_MB.
+
+    vLLM sizes the Triton decode accumulator [batch, heads, splits, rank + 1] for the worst case
+    (max_num_seqs, and splits from max_model_len) and reserves it before KV allocation. With
+    defaults on a 96 GB part (1024 seqs, 262k context -> 376 splits) and our widest latent (1792)
+    that is 66 GB, so the server OOMs before it starts. Halving the splits only trades parallelism
+    over keys: the default 512 MB leaves the measured configurations (16k context, up to 166
+    sequences) at their natural split count.
+    """
+    import os
+    budget = int(float(os.environ.get("QWEN_MLA_SPLITK_SCRATCH_MB", 512)) * (1 << 20))
+    while splits > 1 and batch * heads * splits * lse_dim * 4 > budget:
+        splits //= 2
+    return max(1, splits)
+
+
+def splitk_reserve_bytes(batch: int, heads: int, lse_dim: int, splits: int) -> int:
+    """Bytes that cover every splitk_cap()-ed request with batch <= `batch`."""
+    import os
+    budget = int(float(os.environ.get("QWEN_MLA_SPLITK_SCRATCH_MB", 512)) * (1 << 20))
+    full = batch * heads * splits * lse_dim * 4
+    return min(full, max(budget, batch * heads * lse_dim * 4))
+
+
 def mla_base_tail(hf, tp_size: int = 1) -> int:
     """Live cache tail beyond the latent: packed rope (4x64) + one rms scalar per LOCAL head.
 
@@ -312,12 +337,15 @@ class QwenMLATritonImpl(TritonMLAImpl):
         # attribute (not re-importing the name) is what makes the substitution take effect --
         # `from x import f` in the parent would bind the original at import time.
         import vllm.v1.attention.backends.mla.triton_mla as _t
-        orig = _t.decode_attention_fwd
+        q0 = q[0] if isinstance(q, tuple) else q
+        B, H, lse_dim = q0.shape[0], q0.shape[1], self.kv_lora_rank + 1
+        orig, orig_splits = _t.decode_attention_fwd, _t._compute_num_kv_splits
         _t.decode_attention_fwd = self._mla_kernel
+        _t._compute_num_kv_splits = lambda msl, sm: splitk_cap(B, H, lse_dim, orig_splits(msl, sm))
         try:
             return super().forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)
         finally:
-            _t.decode_attention_fwd = orig
+            _t.decode_attention_fwd, _t._compute_num_kv_splits = orig, orig_splits
 
 
 class MLAMetadata(MLACommonMetadata):
@@ -382,8 +410,11 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
 
         w = self.chunked_prefill_workspace
         if w.shape[-1] != kv_cache_spec.head_size:
+            rows, dt, dev = w.shape[0], w.dtype, w.device
+            del w
+            self.chunked_prefill_workspace = None        # release the narrow one before allocating
             self.chunked_prefill_workspace = _torch.empty(
-                (w.shape[0], kv_cache_spec.head_size), dtype=w.dtype, device=w.device)
+                (rows, kv_cache_spec.head_size), dtype=dt, device=dev)
 
         # ---- decode context parallelism ------------------------------------------------
         # The config gates are removable (see qwen_mla/__init__.py), and with them removed
@@ -450,6 +481,22 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
             self._mla_fi_scale = (hf.head_dim ** -0.5)
             self._mla_fi_qdtype = vllm_config.model_config.dtype
             self._mla_fi_kvdtype = kv_cache_spec.dtype
+
+    def _reserve_attn_logits_workspace(self) -> None:
+        # The parent reserves the split-K accumulator at max_num_seqs x max-context splits; see
+        # splitk_cap for why that cannot stand. forward_mqa caps its splits by the same budget.
+        from vllm.v1.attention.backends.mla.triton_mla import _compute_num_kv_splits
+        from vllm.v1.worker.workspace import current_workspace_manager, is_workspace_manager_initialized
+        from vllm.platforms import current_platform
+        if not is_workspace_manager_initialized():
+            return
+        B = self.vllm_config.scheduler_config.max_num_seqs
+        if getattr(self, "non_causal_multi_token_decode", False):
+            B *= self.reorder_batch_threshold
+        H = self.num_heads * self.dcp_world_size
+        splits = _compute_num_kv_splits(self.model_config.max_model_len, current_platform.num_compute_units())
+        n = splitk_reserve_bytes(B, H, self.mla_dims.kv_lora_rank + 1, splits)
+        current_workspace_manager().get_simultaneous(((n // 4,), torch.float32))
 
     def build(self, *args, **kwargs):
         md = super().build(*args, **kwargs)
