@@ -335,7 +335,7 @@ class QwenMLATritonImpl(TritonMLAImpl):
 
     def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
         # QWEN_MLA_DECODE_BACKEND=flashinfer routes decode to the patched flashinfer fa2 MLA kernel
-        # (~1.9x the Triton fork on the attention term -- docs/06-flashinfer-path.md). Falls
+        # (~1.9x the Triton fork on the attention term). Falls
         # through to Triton for anything that path does not cover, so the fast path never has to
         # guess: multi-token decode rows and the non-causal DSpark block both keep the fork.
         if not (fi_decode.enabled() and self.rms_offset >= 0 and attn_metadata.causal
@@ -448,7 +448,7 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
                 "this rank's rope window and its local heads' rms. Fixing it means caching all "
                 "4 rope groups and all global rms slots (tail 140 -> 280), computing rms for "
                 "every head on every rank, and planning the decode kernel at the all-gathered "
-                "head count. See docs/03-ruled-out.md item 7."
+                "head count."
             )
 
         # ---- flashinfer decode path -------------------------------------------------------

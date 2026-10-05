@@ -7,7 +7,7 @@ WHY. The Triton fork tops out near 1.9 TB/s because its fp32 accumulator [BLOCK_
 puts 255 registers on every thread and spills (ncu: 102% spill overhead, 12.5% occupancy).
 flashinfer's fa2 MLA kernel is JIT-templated on head_dim_ckv/head_dim_kpe, so it can be
 instantiated at MLA's 256/768/1792 -- and once its CKV dimension is sharded across all 8 warps
-instead of 2, it stops spilling entirely. See docs/06-flashinfer-path.md.
+instead of 2, it stops spilling entirely.
 
 THREE THINGS MAKE THIS FIT MLA WITHOUT COPYING OR RESHAPING THE CACHE:
 
