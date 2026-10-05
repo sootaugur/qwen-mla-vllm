@@ -65,7 +65,10 @@ def chunked_workspace_rows(vllm_config) -> int:
     gather (ops/mla_gather.py) handles chunk starts at any token, so build() drops the page
     alignment and one row per prefill is the real floor.
     """
+    import os
     sched, model = vllm_config.scheduler_config, vllm_config.model_config
+    if os.environ.get("QWEN_MLA_PREFILL_WS_ROWS"):          # testing: force many unaligned context chunks
+        return max(int(os.environ["QWEN_MLA_PREFILL_WS_ROWS"]), sched.max_num_seqs)
     return max(min(8 * model.max_model_len, 64 * 1024), sched.max_num_seqs)
 
 
