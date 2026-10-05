@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-mla-vllm"
+version = "0.3.0"
+description = "vLLM general plugin: Qwen3.5/3.8 MLA (variable-latent MLA, partial RoPE) model classes"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+readme = "README.md"
+# The plugin hooks vLLM internals (attention backend, MLA impl, metadata builders), which are not a
+# stable API: pin the version it is tested against. vLLM 0.27.1 also pins the flashinfer whose
+# headers the shipped kernel patches were generated from (qwen_mla/kernels/FLASHINFER_VERSION).
+dependencies = ["vllm==0.27.1"]
+
+# vLLM v1 runs the engine in a separate process, so the model MUST be registered through the
+# `vllm.general_plugins` entry point -- a register_model() call in the parent never reaches the
+# worker. VLLM_PLUGINS=qwen_mla names THIS entry point (not the module); `mvla` is the pre-rename
+# alias (register() is idempotent, so both being loaded is harmless).
+[project.entry-points."vllm.general_plugins"]
+qwen_mla = "qwen_mla:register"
+mvla = "qwen_mla:register"
+
+[tool.setuptools.packages.find]
+include = ["qwen_mla*"]
+
+[tool.setuptools.package-data]
+qwen_mla = ["kernels/*.cuh", "kernels/FLASHINFER_VERSION"]
