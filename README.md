@@ -92,6 +92,7 @@ Nothing is required. Optional environment variables:
 | `QWEN_MLA_DECODE_BACKEND` | `flashinfer` | `triton` disables the FlashInfer fast path |
 | `QWEN_MLA_TWO_PASS` | `1` | `0` disables the two-pass kernel for the 1792 latent |
 | `QWEN_MLA_2P_SCRATCH_MB` | `256` | scratch budget of the two-pass kernel; very long contexts process keys in rounds when exceeded |
+| `QWEN_MLA_SPLITK_SCRATCH_MB` | `512` | cap on the Triton decode's split-K scratch; fewer key splits at very large batch x context |
 | `QWEN_MLA_GLA_SHARD` | `1` | `0` keeps the full latent on every GPU for grouped models (A/B testing) |
 | `QWEN_MLA_CACHE` | `~/.cache/qwen-mla` | where the kernel overlay and compiled modules live |
 | `QWEN_MLA_FI_DEBUG` | unset | `1` logs which decode kernel each layer uses, and why |
