@@ -41,7 +41,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from .partial_rope import patch_partial_rope, rope_keep_from_config
 
-from .mla_impl import QwenMLATritonBackend, mla_gla_split, mla_padded_head_size
+from .mla_impl import QwenMLATritonBackend, chunked_workspace_rows, mla_gla_split, mla_padded_head_size
 
 
 class Qwen3_5MLAAttention(nn.Module):
@@ -158,6 +158,8 @@ class Qwen3_5MLAAttention(nn.Module):
             v_head_dim=self.head_dim, q_lora_rank=None, kv_lora_rank=kv_lora_rank,
             kv_b_proj=self.kv_b_proj, cache_config=cache_config, quant_config=quant_config,
             prefix=f"{prefix}.attn", attn_backend=QwenMLATritonBackend)
+        # The profile run simulates the context up-projection at this many rows; match the builder.
+        self.mla_attn._chunked_prefill_workspace_size = chunked_workspace_rows(self.mla_attn._vllm_config)
         self.mla_attn.impl.rms_offset = self.rms_offset
         self.mla_attn.impl.mla_local_heads = self.num_heads   # rms tail is rank-local
         self.mla_attn.impl.mla_rope_dim = self.rope_dim

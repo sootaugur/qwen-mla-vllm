@@ -55,6 +55,20 @@ from .ops.mla_gather import gather_cache_torch
 from .prefill_align import patch_prefill_backend
 
 
+def chunked_workspace_rows(vllm_config) -> int:
+    """Rows of the chunked-prefill context workspace: vLLM's rule without its one-page-per-sequence floor.
+
+    vLLM sizes it min(max(8 x max_model_len, 4 x max_num_seqs x page), 64k) and then floors it at
+    max_num_seqs x page, so every prefill can get a page-aligned chunk. Our pages are 784 tokens, so
+    at the default 1024 sequences that floor is 802,816 rows: 3.3 GB of workspace for the widest
+    group, and a 16 GB simulated up-projection in the profile run, which OOMs before serving. Our
+    gather (ops/mla_gather.py) handles chunk starts at any token, so build() drops the page
+    alignment and one row per prefill is the real floor.
+    """
+    sched, model = vllm_config.scheduler_config, vllm_config.model_config
+    return max(min(8 * model.max_model_len, 64 * 1024), sched.max_num_seqs)
+
+
 def splitk_cap(batch: int, heads: int, lse_dim: int, splits: int) -> int:
     """Largest split count <= `splits` whose fp32 split-K scratch fits QWEN_MLA_SPLITK_SCRATCH_MB.
 
@@ -409,12 +423,11 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
         self.metadata_cls = MLAMetadata
 
         w = self.chunked_prefill_workspace
-        if w.shape[-1] != kv_cache_spec.head_size:
-            rows, dt, dev = w.shape[0], w.dtype, w.device
-            del w
-            self.chunked_prefill_workspace = None        # release the narrow one before allocating
-            self.chunked_prefill_workspace = _torch.empty(
-                (rows, kv_cache_spec.head_size), dtype=dt, device=dev)
+        rows, dt, dev = chunked_workspace_rows(vllm_config), w.dtype, w.device
+        del w
+        self.chunked_prefill_workspace = None            # release the parent's before allocating
+        self.chunked_prefill_workspace_size = rows
+        self.chunked_prefill_workspace = _torch.empty((rows, kv_cache_spec.head_size), dtype=dt, device=dev)
 
         # ---- decode context parallelism ------------------------------------------------
         # The config gates are removable (see qwen_mla/__init__.py), and with them removed
@@ -499,7 +512,14 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
         current_workspace_manager().get_simultaneous(((n // 4,), torch.float32))
 
     def build(self, *args, **kwargs):
-        md = super().build(*args, **kwargs)
+        # Unaligned context chunks (see chunked_workspace_rows); the parent hard-codes alignment.
+        import vllm.model_executor.layers.attention.mla_attention as _m
+        orig = _m.build_mla_chunked_context_metadata
+        _m.build_mla_chunked_context_metadata = lambda **kw: orig(**{**kw, "align_chunk_to_block": False})
+        try:
+            md = super().build(*args, **kwargs)
+        finally:
+            _m.build_mla_chunked_context_metadata = orig
         common = kwargs.get("common_attn_metadata", args[1] if len(args) > 1 else None)
         fi_decode.plan_for_step(self, md, common)
         return md
