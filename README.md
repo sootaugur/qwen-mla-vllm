@@ -1,5 +1,8 @@
 # qwen-mla-vllm
 
+> **Experimental.** Verified on RTX PRO 6000 (Blackwell) at TP=1 and TP=2 with vLLM 0.27.1;
+> little real-world use yet. Bug reports welcome.
+
 A [vLLM](https://github.com/vllm-project/vllm) plugin that serves the **training-free MLA retrofits
 of Qwen3.8-27B** with a compressed **latent KV cache**:
 
@@ -7,8 +10,10 @@ of Qwen3.8-27B** with a compressed **latent KV cache**:
 |---|---|---|
 | [TelperionAI/Qwen3.8-27B-MLA](https://huggingface.co/TelperionAI/Qwen3.8-27B-MLA) | shared latent (Multi-head Latent Attention) | 1 GPU (TP=1) |
 | [TelperionAI/Qwen3.8-27B-GLA-g2](https://huggingface.co/TelperionAI/Qwen3.8-27B-GLA-g2) | latent split into 2 head groups | 2 GPUs (TP=2) |
+| [TelperionAI/Qwen3.8-27B-MLA-FP8](https://huggingface.co/TelperionAI/Qwen3.8-27B-MLA-FP8) | MLA, FP8 weights (29.7 GB) | 1 GPU (TP=1) |
+| [TelperionAI/Qwen3.8-27B-GLA-g2-FP8](https://huggingface.co/TelperionAI/Qwen3.8-27B-GLA-g2-FP8) | GLA-g2, FP8 weights (29.7 GB) | 2 GPUs (TP=2) |
 
-Both cache **half the KV bytes per token** of the base model. Installing the plugin is all vLLM needs
+All cache **half the KV bytes per token** of the base model. Installing the plugin is all vLLM needs
 to load them; no fork, no flags.
 
 ## Quick start
@@ -36,7 +41,8 @@ The first start JIT-compiles the fast decode kernel (a few minutes); later start
 
 ## Requirements
 
-* **NVIDIA GPU** with vLLM 0.27.1 support. Tested on RTX PRO 6000 (Blackwell, sm_120) and H100 (sm_90).
+* **NVIDIA GPU** with vLLM 0.27.1 support. This version is tested on RTX PRO 6000
+  (Blackwell, sm_120); earlier versions ran on H100 (sm_90).
 * **vLLM 0.27.1** exactly (installed as a dependency). The plugin hooks vLLM internals that change
   between releases.
 * **For the fast decode path: the CUDA toolkit (`nvcc`) and `ninja`**, used to JIT-compile a patched

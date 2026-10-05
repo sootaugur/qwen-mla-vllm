@@ -34,6 +34,9 @@ Two GPUs:
 vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-parser qwen3
 ```
 
+* FP8 weights (about 30 GB instead of 54 GB; same KV cache): use `TelperionAI/Qwen3.8-27B-MLA-FP8` or
+  `TelperionAI/Qwen3.8-27B-GLA-g2-FP8` with the same flags. They need a GPU with FP8 support (Hopper or
+  Blackwell).
 * If the GPUs are connected only over PCIe (no NVLink: RTX PRO, GeForce), add
   `--disable-custom-all-reduce`. Without it, multi-GPU startup can hang.
 * The first start JIT-compiles a CUDA kernel and can take several minutes. Do not treat a slow
