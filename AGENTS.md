@@ -34,7 +34,11 @@ Two GPUs:
 vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-parser qwen3
 ```
 
-* FP8 weights (about 30 GB instead of 54 GB; same KV cache): use `TelperionAI/Qwen3.8-27B-MLA-FP8` or
+* Recommended: add `--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'` (MTP speculative
+  decoding, 1.4-1.9x faster decode). Omit it if the user wants the plainest setup.
+* The models accept images like the base model. If the user only needs text, add
+  `--limit-mm-per-prompt '{"image": 0, "video": 0}'`.
+* FP8 weights (about 31 GB instead of 56 GB; same KV cache): use `TelperionAI/Qwen3.8-27B-MLA-FP8` or
   `TelperionAI/Qwen3.8-27B-GLA-g2-FP8` with the same flags. They need a GPU with FP8 support (Hopper or
   Blackwell).
 * If the GPUs are connected only over PCIe (no NVLink: RTX PRO, GeForce), add

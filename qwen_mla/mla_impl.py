@@ -43,7 +43,8 @@ cache row and kills concat_and_cache_mla inside the CUDA kernel.
 from __future__ import annotations
 
 import torch
-from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
+from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata, QueryLenSupport
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla.triton_mla import (TritonMLABackend, TritonMLAImpl,
                                                        TritonMLAMetadataBuilder)
 
@@ -339,13 +340,13 @@ class QwenMLATritonImpl(TritonMLAImpl):
         # through to Triton for anything that path does not cover, so the fast path never has to
         # guess: multi-token decode rows and the non-causal DSpark block both keep the fork.
         if not (fi_decode.enabled() and self.rms_offset >= 0 and attn_metadata.causal
-                and attn_metadata.num_decode_tokens == attn_metadata.num_decodes):
+                and attn_metadata.decode.seq_lens.shape[0] == attn_metadata.num_decode_tokens):
             fi_decode._dbg("gate failed", enabled=fi_decode.enabled(), rms=self.rms_offset >= 0,
                                 causal=getattr(attn_metadata, "causal", None),
                                 ndt=getattr(attn_metadata, "num_decode_tokens", None), nd=getattr(attn_metadata, "num_decodes", None))
         if (fi_decode.enabled() and self.rms_offset >= 0
                 and attn_metadata.causal
-                and attn_metadata.num_decode_tokens == attn_metadata.num_decodes):
+                and attn_metadata.decode.seq_lens.shape[0] == attn_metadata.num_decode_tokens):
             out = fi_decode.forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata,
                                              layer)
             if out is not None:          # None = layout the fast path declined; use Triton
@@ -397,6 +398,13 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
                      MLACommonImpl then splits them on exactly that boundary. Too narrow by 4x,
                      and varying per group, so no single model-level value can be right.
     """
+
+    # Speculative decoding: a verify step has 1+k query tokens per request. vLLM's Triton MLA
+    # declares SINGLE_ONLY, so those steps went down the PREFILL path -- gather each request's whole
+    # context and up-project it, every step -- and MTP measured slower per stream as concurrency grew.
+    # UNIFORM routes them to decode; _build_decode flattens them into single-token causal rows.
+    query_len_support = QueryLenSupport.UNIFORM
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         import torch as _torch
@@ -506,13 +514,48 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
         from vllm.platforms import current_platform
         if not is_workspace_manager_initialized():
             return
-        B = self.vllm_config.scheduler_config.max_num_seqs
-        if getattr(self, "non_causal_multi_token_decode", False):
-            B *= self.reorder_batch_threshold
+        # Decode rows: one per query token (spec verify steps are flattened, see _build_decode).
+        B = self.vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold
         H = self.num_heads * self.dcp_world_size
         splits = _compute_num_kv_splits(self.model_config.max_model_len, current_platform.num_compute_units())
         n = splitk_reserve_bytes(B, H, self.mla_dims.kv_lora_rank + 1, splits)
         current_workspace_manager().get_simultaneous(((n // 4,), torch.float32))
+
+    def _build_decode(self, block_table_tensor, seq_lens_device, max_seq_len, query_start_loc_cpu,
+                      query_start_loc_device, num_decode_tokens, dcp_tot_seq_lens_device):
+        """Flatten a uniform multi-token decode (spec verify) into one single-token row per query token.
+
+        Row j of a request with q query tokens and total length L attends to the first L - (q-1-j)
+        tokens: exactly causal attention over its context plus the earlier draft tokens. Every decode
+        kernel here (flashinfer, Triton, two-pass) then sees plain single-token decode rows. Device
+        ops only and static shapes, so this is CUDA-graph safe.
+        """
+        md = super()._build_decode(block_table_tensor, seq_lens_device, max_seq_len, query_start_loc_cpu,
+                                   query_start_loc_device, num_decode_tokens, dcp_tot_seq_lens_device)
+        n = block_table_tensor.shape[0]
+        q = num_decode_tokens // n if n else 1
+        if q > 1:
+            assert q * n == num_decode_tokens, (num_decode_tokens, n)
+            # PERSISTENT buffers, written in place: a full CUDA graph replays reads from the addresses it
+            # captured, so fresh tensors per step (repeat_interleave) left it reading stale memory --
+            # garbage text under graphs, correct under --enforce-eager.
+            rows, width = n * q, block_table_tensor.shape[1]
+            bt, sl = getattr(self, "_mla_flat_bt", None), getattr(self, "_mla_flat_sl", None)
+            if bt is None or bt.shape[0] < rows or bt.shape[1] != width:
+                cap = max(rows, self.vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold)
+                bt = torch.zeros(cap, width, dtype=block_table_tensor.dtype, device=block_table_tensor.device)
+                sl = torch.zeros(cap, dtype=seq_lens_device.dtype, device=seq_lens_device.device)
+                self._mla_flat_bt, self._mla_flat_sl = bt, sl
+            offs = getattr(self, "_mla_flat_offs", None)
+            if offs is None or offs.numel() != q:
+                offs = self._mla_flat_offs = torch.arange(1 - q, 1, device=sl.device, dtype=sl.dtype)
+            bt[:rows].view(n, q, width).copy_(block_table_tensor[:, None, :])
+            v = sl[:rows].view(n, q)
+            torch.add(seq_lens_device[:, None], offs[None, :], out=v)
+            v.clamp_(min=0)                       # CUDA-graph padding rows have length 0
+            md.block_table, md.seq_lens = bt[:rows], sl[:rows]
+        object.__setattr__(md, "_mla_q", q)
+        return md
 
     def build(self, *args, **kwargs):
         # Unaligned context chunks (see chunked_workspace_rows); the parent hard-codes alignment.

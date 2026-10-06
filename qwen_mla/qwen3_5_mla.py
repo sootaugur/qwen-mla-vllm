@@ -148,6 +148,22 @@ class Qwen3_5MLAAttention(nn.Module):
             rp_clean["partial_rotary_factor"] = self.rope_dim / self.head_dim
         self.rotary_emb = get_rope(self.head_dim, max_position=config.max_position_embeddings,
                                    is_neox_style=True, rope_parameters=rp_clean)
+        # M-RoPE (multimodal serving): positions arrive as [3, T] (time, height, width) and each
+        # rotary frequency takes ONE of the three, by the teacher's own section layout. Text tokens
+        # have t == h == w, so this matters only for image/video tokens. The table maps each column
+        # of our (kept-frequency) cos/sin cache to its section, by ORIGINAL frequency index.
+        self.mrope_section = rp.get("mrope_section")
+        if self.mrope_section:
+            s0, s1, s2 = self.mrope_section
+            inter = bool(rp.get("mrope_interleaved", False))
+
+            def _sec(f):                       # = vLLM's apply_interleaved_rope / chunked split
+                if inter:
+                    return 1 if (f % 3 == 1 and f < 3 * s1) else (2 if (f % 3 == 2 and f < 3 * s2) else 0)
+                return 0 if f < s0 else (1 if f < s0 + s1 else 2)
+            keep = self.rope_keep if self.rope_keep is not None else list(range(self.model_rope_dim // 2))
+            self.register_buffer("_mrope_col_sec", torch.tensor([_sec(int(f)) for f in keep] * 2),
+                                 persistent=False)
         if self.rope_keep is not None:
             patch_partial_rope(self.rotary_emb, self.rope_keep, self.model_rope_dim,
                                float(rp_clean.get("rope_theta", 1e7)))
@@ -226,12 +242,16 @@ class Qwen3_5MLAAttention(nn.Module):
         # new_empty, not new_zeros: rotary only touches the leading rotary_dim and passes the
         # rest through, and both results are sliced back to [..., :rd] immediately below, so the
         # tail is never read. Zeroing it was 256 dims written per head to use 64.
-        q_pad = q.new_empty(n, nh, hd); q_pad[..., :rd] = q[..., :rd]
-        k_pad = q.new_empty(n, self.num_kv_heads, hd)
-        k_pad[..., :rd] = (kr_raw * w[:rd]).to(q.dtype)   # w BEFORE rotation: rotation mixes dims
-        q_rot, k_rot = self.rotary_emb(positions, q_pad.reshape(n, -1), k_pad.reshape(n, -1))
-        q_rot = q_rot.view(n, nh, hd)[..., :rd]
-        k_rot = k_rot.view(n, self.num_kv_heads, hd)[..., :rd]
+        if positions.ndim == 2:                            # M-RoPE positions [3, T]
+            q_rot, k_rot = self._mrope_rotate(positions, q[..., :rd],
+                                              (kr_raw * w[:rd]).to(q.dtype))
+        else:
+            q_pad = q.new_empty(n, nh, hd); q_pad[..., :rd] = q[..., :rd]
+            k_pad = q.new_empty(n, self.num_kv_heads, hd)
+            k_pad[..., :rd] = (kr_raw * w[:rd]).to(q.dtype)   # w BEFORE rotation: rotation mixes dims
+            q_rot, k_rot = self.rotary_emb(positions, q_pad.reshape(n, -1), k_pad.reshape(n, -1))
+            q_rot = q_rot.view(n, nh, hd)[..., :rd]
+            k_rot = k_rot.view(n, self.num_kv_heads, hd)[..., :rd]
 
         # q = [ nope (absorbed by vLLM via W_UK_T) | packed rope in this head's group slot | pad ]
         # The slot is chosen by GLOBAL head index: under TP this rank's local head i is global
@@ -253,6 +273,21 @@ class Qwen3_5MLAAttention(nn.Module):
         out, _ = self.o_proj(attn_out)
         return out
 
+
+    def _mrope_rotate(self, positions, q_r, k_r):
+        """Neox rotation of [n, heads, rd] q and k with per-frequency (t, h, w) positions."""
+        if not self.mrope_section:
+            raise ValueError("3-row (M-RoPE) positions but the config has no mrope_section")
+        n, rd = q_r.shape[0], q_r.shape[-1]
+        cs = self.rotary_emb.cos_sin_cache.to(q_r.dtype)[positions]           # [3, n, rd]
+        cs = cs.gather(0, self._mrope_col_sec.view(1, 1, rd).expand(1, n, rd))[0]
+        cos, sin = cs.chunk(2, dim=-1)
+        cos, sin = cos[:, None, :], sin[:, None, :]
+
+        def rot(x):
+            x1, x2 = x.chunk(2, dim=-1)
+            return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+        return rot(q_r), rot(k_r)
 
     def build_kv_b_from_up_projections(self, k_up: torch.Tensor, v_up: torch.Tensor) -> None:
         """kv_b_proj = per-head [ (1+w_nope) * W_UK ; W_UV ], stacked over heads.

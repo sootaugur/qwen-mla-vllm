@@ -270,7 +270,7 @@ class _RankPlan:
         self.planned_scale = scale
 
 
-def _decode_lens_cpu(common, nd):
+def _decode_lens_cpu(common, nd, exact=False):
     """The decode rows' sequence lengths on the host, without forcing a device->host copy.
 
     vLLM's seq_lens_cpu property syncs when the cached copy is absent (async scheduling), so read the
@@ -280,7 +280,7 @@ def _decode_lens_cpu(common, nd):
     if common is None:
         return None
     c = getattr(common, "_seq_lens_cpu", None)
-    if c is None:
+    if c is None and not exact:                 # the upper bound overstates lengths under spec decode
         c = getattr(common, "seq_lens_cpu_upper_bound", None)
     if c is None:
         return None
@@ -307,8 +307,11 @@ def plan_for_step(builder, md, common=None) -> None:
             builder._mla_fi_plan = plan
         if not plan.fits:
             return
-        lens_cpu = (_decode_lens_cpu(common, md.decode.seq_lens.shape[0])
-                    if not builder._mla_fi_cfg.get("spec") else None)
+        q = getattr(md.decode, "_mla_q", 1)
+        rows = md.decode.seq_lens.shape[0]
+        lens_cpu = _decode_lens_cpu(common, rows // q, exact=q > 1)
+        if lens_cpu is not None and q > 1:          # same flattening as the builder's _build_decode
+            lens_cpu = (lens_cpu[:, None] + torch.arange(1 - q, 1, dtype=lens_cpu.dtype)[None, :]).reshape(-1).clamp_(min=0)
         if lens_cpu is not None and os.environ.get("QWEN_MLA_FI_SYNC_PLAN") != "1":
             _dbg("plan path", path="cpu (no sync)", rank=builder._mla_fi_cfg["rank"])
             plan.plan_cpu(md.decode.block_table, md.decode.seq_lens, lens_cpu, builder._mla_fi_scale,

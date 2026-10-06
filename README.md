@@ -10,25 +10,32 @@ of Qwen3.8-27B** with a compressed **latent KV cache**:
 |---|---|---|
 | [TelperionAI/Qwen3.8-27B-MLA](https://huggingface.co/TelperionAI/Qwen3.8-27B-MLA) | shared latent (Multi-head Latent Attention) | 1 GPU (TP=1) |
 | [TelperionAI/Qwen3.8-27B-GLA-g2](https://huggingface.co/TelperionAI/Qwen3.8-27B-GLA-g2) | latent split into 2 head groups | 2 GPUs (TP=2) |
-| [TelperionAI/Qwen3.8-27B-MLA-FP8](https://huggingface.co/TelperionAI/Qwen3.8-27B-MLA-FP8) | MLA, FP8 weights (29.7 GB) | 1 GPU (TP=1) |
-| [TelperionAI/Qwen3.8-27B-GLA-g2-FP8](https://huggingface.co/TelperionAI/Qwen3.8-27B-GLA-g2-FP8) | GLA-g2, FP8 weights (29.7 GB) | 2 GPUs (TP=2) |
+| [TelperionAI/Qwen3.8-27B-MLA-FP8](https://huggingface.co/TelperionAI/Qwen3.8-27B-MLA-FP8) | MLA, FP8 weights (31.5 GB) | 1 GPU (TP=1) |
+| [TelperionAI/Qwen3.8-27B-GLA-g2-FP8](https://huggingface.co/TelperionAI/Qwen3.8-27B-GLA-g2-FP8) | GLA-g2, FP8 weights (31.5 GB) | 2 GPUs (TP=2) |
 
-All cache **half the KV bytes per token** of the base model. Installing the plugin is all vLLM needs
-to load them; no fork, no flags.
+All cache **half the KV bytes per token** of the base model, and all keep the base model's **vision
+tower** and **MTP head** (for speculative decoding). Installing the plugin is all vLLM needs to load
+them; no fork, no extra flags.
 
 ## Quick start
 
 ```bash
 pip install "git+https://github.com/sootaugur/qwen-mla-vllm"      # also installs vllm==0.27.1
-vllm serve TelperionAI/Qwen3.8-27B-MLA --reasoning-parser qwen3
+vllm serve TelperionAI/Qwen3.8-27B-MLA --reasoning-parser qwen3 \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
 ```
 
 Two GPUs, for the grouped model:
 
 ```bash
-vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-parser qwen3
+vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-parser qwen3 \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
 # PCIe-only GPUs (no NVLink: RTX PRO, GeForce): add --disable-custom-all-reduce
 ```
+
+`--speculative-config` turns on MTP speculative decoding (optional; see [below](#speculative-decoding-mtp)).
+Images work as with the base model (OpenAI `image_url` content). For text-only serving, add
+`--limit-mm-per-prompt '{"image": 0, "video": 0}'` to skip reserving memory for the vision encoder.
 
 Test request:
 
@@ -52,7 +59,8 @@ The first start JIT-compiles the fast decode kernel (a few minutes); later start
 
 ## How it works
 
-The checkpoints declare the architecture `Qwen3_5MLAForCausalLM`; this plugin registers it through
+The checkpoints declare the architecture `Qwen3_5MLAForConditionalGeneration` (base model's vision tower in
+front of the MLA language model; text-only checkpoints use `Qwen3_5MLAForCausalLM`); this plugin registers it through
 vLLM's `vllm.general_plugins` entry point, so vLLM finds it automatically. The 16 full-attention
 layers cache a per-layer latent (ranks 256 / 768 / 1792) plus a small RoPE and normalisation tail,
 instead of per-head keys and values. The other 48 layers (Gated DeltaNet linear attention), the MLPs
@@ -89,6 +97,37 @@ RTX PRO 6000 (Blackwell), bf16 weights and KV, vLLM 0.27.1, 16k-token prompts, 2
 
 Prefill throughput matches the base model (within 3%).
 
+### Speculative decoding (MTP)
+
+The models keep the base model's MTP head unchanged, and it drafts for the retrofit as well as it does
+for the base model: the same mean accepted tokens per step (k=3: 1.86 vs 1.82). Decode throughput,
+tokens/s at 1 / 8 / 32 concurrent requests (64 mixed prompts, thinking on, Qwen's recommended sampling,
+bf16):
+
+| | no MTP | MTP, k=3 | speedup |
+|---|---|---|---|
+| Qwen3.8-27B, TP=1 | 26 / 155 / 547 | 57 / 326 / 972 | 2.16× / 2.10× / 1.78× |
+| **Qwen3.8-27B-MLA, TP=1** | 25 / 129 / 548 | 47 / 227 / 858 | 1.85× / 1.76× / 1.57× |
+| Qwen3.8-27B, TP=2 | 45 / 240 / 850 | 91 / 431 / 1,393 | 2.03× / 1.79× / 1.64× |
+| **Qwen3.8-27B-GLA-g2, TP=2** | 42 / 217 / 846 | 70 / 341 / 1,180 | 1.65× / 1.57× / 1.39× |
+
+The speedup is smaller than the base model's because a verify step currently reads the latent cache once
+per draft token; a single causal pass per request is planned. Greedy output with MTP differs from greedy
+output without it no more than it does for the base model.
+
+### Vision
+
+Paired against the base model on the same items, greedy, thinking off (300 ChartQA test questions, relaxed
+accuracy; 300 DocVQA validation questions, ANLS):
+
+| | ChartQA | DocVQA |
+|---|---|---|
+| Qwen3.8-27B | 89.7 | 97.1 |
+| **Qwen3.8-27B-MLA** | 88.0 (−1.7 [−4.3, +1.0]) | 97.3 (+0.1 [−1.0, +1.3]) |
+| **Qwen3.8-27B-GLA-g2** (TP=2) | 87.7 (−2.0 [−5.3, +1.0]) | 96.6 (−0.5 [−2.2, +1.1]) |
+
+No difference is significant; 84–95% of answers are identical to the base model's.
+
 ## Configuration
 
 Nothing is required. Optional environment variables:
@@ -124,11 +163,15 @@ Kernel correctness tests (need a GPU):
 python tests/test_fi_partial_rope.py --layout tp1 --rms-spread --page 784 --shuffle --ragged
 python tests/test_two_pass_1792.py
 python tests/test_decode_numerics.py
+python tests/test_mrope.py          # CPU only
 ```
 
 ## Limitations
 
 * vLLM 0.27.1 only, for now.
+* At TP=2, startup can sit in CUDA-graph capture for several minutes (the log repeats "No available
+  shared memory broadcast block"); it completes. Starting two TP=2 servers at the same moment on one
+  machine has hung during capture; start them one after another.
 * Decode context parallelism (DCP) is not supported.
 * Tested at TP=1 and TP=2. The GLA per-group cache engages when the tensor-parallel size is a multiple
   of the group count (2); at TP=1 GLA-g2 runs like plain MLA. TP=4 should work (each pair of GPUs
