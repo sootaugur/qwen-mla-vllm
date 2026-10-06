@@ -220,30 +220,36 @@ def _inherit_qwen3_5_config_hook():
         MODELS_CONFIG_MAP.setdefault(arch, Qwen3_5ForConditionalGenerationConfig)
 
 
+_ORIG_HF_CONFIG_OVERRIDE = None
+
+
+def _mtp_hf_config_override(hf_config):
+    """Module-level (not a closure): vLLM stores this callable in its config, and data-parallel startup
+    pickles the config into each engine process."""
+    archs = getattr(hf_config, "architectures", None) or []
+    if getattr(hf_config, "model_type", None) == "qwen3_5_text" and any(a in ALL_ARCHS for a in archs):
+        hf_config.model_type = "qwen3_5_mtp"
+        hf_config.update({"n_predict": getattr(hf_config, "mtp_num_hidden_layers", None),
+                          "architectures": ["Qwen3_5MTP"]})
+        return hf_config
+    return _ORIG_HF_CONFIG_OVERRIDE(hf_config)
+
+
 def _enable_mtp_draft():
     """Let `--speculative-config '{"method": "mtp"}'` find the Qwen3.5 MTP head.
 
     SpeculativeConfig.hf_config_override turns a target config into its draft config by
-    model_type, and recognises Qwen3.5 only as "qwen3_5" (the multimodal wrapper). Our
-    checkpoints are text-only, model_type "qwen3_5_text", so without this the draft keeps the
-    target's architecture and vLLM would build a second full model as the "draft". The MTP head
-    itself is the base model's, unmodified: standard attention, its own KV cache.
+    model_type, and recognises Qwen3.5 only as "qwen3_5" (the multimodal wrapper). Text-only
+    checkpoints are model_type "qwen3_5_text", so without this the draft keeps the target's
+    architecture and vLLM would build a second full model as the "draft". The MTP head itself is
+    the base model's, unmodified: standard attention, its own KV cache.
     """
+    global _ORIG_HF_CONFIG_OVERRIDE
     from vllm.config.speculative import SpeculativeConfig
     if getattr(SpeculativeConfig, "_qwen_mla_mtp", False):
         return
-    orig = SpeculativeConfig.hf_config_override
-
-    def hf_config_override(hf_config):
-        archs = getattr(hf_config, "architectures", None) or []
-        if getattr(hf_config, "model_type", None) == "qwen3_5_text" and any(a in ALL_ARCHS for a in archs):
-            hf_config.model_type = "qwen3_5_mtp"
-            hf_config.update({"n_predict": getattr(hf_config, "mtp_num_hidden_layers", None),
-                              "architectures": ["Qwen3_5MTP"]})
-            return hf_config
-        return orig(hf_config)
-
-    SpeculativeConfig.hf_config_override = staticmethod(hf_config_override)
+    _ORIG_HF_CONFIG_OVERRIDE = SpeculativeConfig.hf_config_override
+    SpeculativeConfig.hf_config_override = staticmethod(_mtp_hf_config_override)
     SpeculativeConfig._qwen_mla_mtp = True
 
 
