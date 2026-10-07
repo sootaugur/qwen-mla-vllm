@@ -29,14 +29,31 @@ def _skip_cudagraph_memory_profiling_if_unwanted():
     untouched. Skipping the estimate only makes the KV budget more conservative.
     """
     import os
-    if os.environ.get("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS") != "0":
-        return
     import sys
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
     if getattr(GPUModelRunner, "_mla_profiling_patched", False):
         return
-    GPUModelRunner.profile_cudagraph_memory = lambda self: 0
     GPUModelRunner._mla_profiling_patched = True
+    if os.environ.get("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS") != "0":
+        # Automatic fallback: with an FP8 KV cache plus the MTP draft's standard-attention layer, the
+        # minimal profiling cache overruns exactly as described above (measured: "setStorage: sizes
+        # [12800, 64, 4, 512] ... out of bounds"). Recover the way vLLM's own no-graphs branch does --
+        # release the profiling cache and report no estimate -- for that error only.
+        orig = GPUModelRunner.profile_cudagraph_memory
+
+        def profile_cudagraph_memory(self):
+            try:
+                return orig(self)
+            except RuntimeError as e:
+                if "setStorage" not in str(e):
+                    raise
+                self._cleanup_profiling_kv_cache()
+                print("[qwen-mla] CUDA-graph memory estimate skipped (mixed padded KV page shapes); "
+                      "KV budget computed without it", file=sys.stderr, flush=True)
+                return 0
+        GPUModelRunner.profile_cudagraph_memory = profile_cudagraph_memory
+        return
+    GPUModelRunner.profile_cudagraph_memory = lambda self: 0
     print("[qwen-mla] cudagraph memory profiling skipped "
           "(VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0)", file=sys.stderr, flush=True)
 
@@ -200,6 +217,7 @@ def register():
     _skip_cudagraph_memory_profiling_if_unwanted()
     _inherit_qwen3_5_config_hook()
     _enable_mtp_draft()
+    _fp8_kv_default_from_checkpoint()
 
 
 def _inherit_qwen3_5_config_hook():
@@ -251,6 +269,42 @@ def _enable_mtp_draft():
     _ORIG_HF_CONFIG_OVERRIDE = SpeculativeConfig.hf_config_override
     SpeculativeConfig.hf_config_override = staticmethod(_mtp_hf_config_override)
     SpeculativeConfig._qwen_mla_mtp = True
+
+
+def _fp8_kv_default_from_checkpoint():
+    """`--kv-cache-dtype auto` -> fp8 for our checkpoints that ship calibrated FP8 KV.
+
+    The quantized students declare an 8-bit float kv_cache_scheme and carry their own scales in
+    `mla_kv_cache_scales`, meaning "serve with an FP8 cache unless told otherwise". vLLM honours such a
+    declaration only for some quantization formats (compressed-tensors does, cuda-exl3 does not), so
+    resolve it here for our architectures, whatever the weight format. An explicit --kv-cache-dtype always
+    wins. BF16 parents carry scales but no kv_cache_scheme, so they stay BF16 by default.
+    """
+    import vllm.utils.torch_utils as tu
+    if getattr(tu, "_qwen_mla_kv_default", False):
+        return
+    orig = tu.resolve_kv_cache_dtype_string
+
+    def resolve_kv_cache_dtype_string(kv_cache_dtype, model_config):
+        out = orig(kv_cache_dtype, model_config)
+        if kv_cache_dtype != "auto" or out != "auto":
+            return out
+        hf = getattr(model_config, "hf_config", None)
+        archs = getattr(hf, "architectures", None) or []
+        if not any(a in ALL_ARCHS for a in archs):
+            return out
+        qc = getattr(hf, "quantization_config", None) or {}
+        scheme = qc.get("kv_cache_scheme") if isinstance(qc, dict) else None
+        tc = getattr(hf, "text_config", hf)
+        if (isinstance(scheme, dict) and scheme.get("num_bits") == 8 and scheme.get("type") == "float"
+                and getattr(tc, "mla_kv_cache_scales", None)):
+            return "fp8"
+        return out
+
+    tu.resolve_kv_cache_dtype_string = resolve_kv_cache_dtype_string
+    import vllm.engine.arg_utils as au        # imported the name directly
+    au.resolve_kv_cache_dtype_string = resolve_kv_cache_dtype_string
+    tu._qwen_mla_kv_default = True
 
 
 def _fingerprint_compile_cache():

@@ -41,3 +41,11 @@ class Qwen3_5MLAForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         # configs lack. Provide it so speculative decoding works on the multimodal model.
         if not hasattr(self.config, "image_token_index"):
             self.config.image_token_index = self.config.image_token_id
+
+    def process_weights_after_loading(self):
+        # vLLM calls the model-level hook on the TOP module only; the MLA language model checks there
+        # that every layer's kv_b_proj was built (its load_weights may be called in several pieces).
+        hook = getattr(self.language_model, "process_weights_after_loading", None)
+        if hook is not None:
+            hook()
+        getattr(super(), "process_weights_after_loading", lambda: None)()

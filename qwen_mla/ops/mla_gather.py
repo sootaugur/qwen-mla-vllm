@@ -27,11 +27,12 @@ def gather_cache_torch(*, src_cache: torch.Tensor, dst: torch.Tensor,
                        block_table: torch.Tensor, cu_seq_lens: torch.Tensor,
                        token_to_seq: torch.Tensor, num_tokens: int,
                        kv_cache_dtype: str, scale: torch.Tensor,
-                       seq_starts: torch.Tensor | None = None) -> None:
-    if kv_cache_dtype not in ("auto", "bfloat16", "float16"):
-        raise NotImplementedError(
-            f"MLA gather fallback has no dequant path for kv_cache_dtype={kv_cache_dtype}; "
-            f"this build serves bf16 deliberately")
+                       seq_starts: torch.Tensor | None = None, mla_rms=None) -> None:
+    fp8 = str(kv_cache_dtype).startswith("fp8")
+    if not fp8 and kv_cache_dtype not in ("auto", "bfloat16", "float16"):
+        raise NotImplementedError(f"MLA gather fallback has no dequant path for kv_cache_dtype={kv_cache_dtype}")
+    if fp8 and mla_rms is None:
+        raise NotImplementedError("FP8 MLA gather needs the row layout (rms offset, heads)")
     if num_tokens <= 0:
         return
 
@@ -42,4 +43,25 @@ def gather_cache_torch(*, src_cache: torch.Tensor, dst: torch.Tensor,
     if seq_starts is not None:
         tok = tok + seq_starts.long()[s]
     blk = block_table[s, tok // block_size].long()
-    dst[:num_tokens].copy_(src_cache[blk, tok % block_size].reshape(num_tokens, -1))
+    if not fp8:
+        dst[:num_tokens].copy_(src_cache[blk, tok % block_size].reshape(num_tokens, -1))
+        return
+    # FP8 row: [latent | rope] e4m3 (x scale) then the rms tail as raw bf16 (2 bytes per head). The
+    # destination is the bf16 workspace the prefill path splits on the BF16 layout, where rms sits at
+    # rms_offset as one element per head -- so decode into exactly that.
+    off, nh = mla_rms[:2]
+    mode = mla_rms[2] if len(mla_rms) > 2 else "bf16"
+    rows = src_cache.view(torch.uint8)[blk, tok % block_size].reshape(num_tokens, -1)
+    if mode == "log8":                     # rms as a uint8 code of log2(rms)
+        from ..mla_impl import RMS_LOG2_HI, RMS_LOG2_LO
+        dst[:num_tokens, :off].copy_((rows[:, :off].view(torch.float8_e4m3fn).float() * scale.float()).to(dst.dtype))
+        code = rows[:, off:off + nh].float()
+        dst[:num_tokens, off:off + nh].copy_(
+            torch.exp2(RMS_LOG2_LO + code * ((RMS_LOG2_HI - RMS_LOG2_LO) / 255.0)).to(dst.dtype))
+        return
+    if mode == "e4m3":                     # compact: the whole row (rms included) is e4m3 x scale
+        dst[:num_tokens, :off + nh].copy_(
+            (rows[:, :off + nh].view(torch.float8_e4m3fn).float() * scale.float()).to(dst.dtype))
+        return
+    dst[:num_tokens, :off].copy_((rows[:, :off].view(torch.float8_e4m3fn).float() * scale.float()).to(dst.dtype))
+    dst[:num_tokens, off:off + nh].copy_(rows[:, off:off + 2 * nh].contiguous().view(torch.bfloat16).to(dst.dtype))

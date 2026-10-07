@@ -6,16 +6,20 @@
 A [vLLM](https://github.com/vllm-project/vllm) plugin that serves the **training-free MLA retrofits
 of Qwen3.8-27B** with a compressed **latent KV cache**:
 
-| model | what it is | best for |
-|---|---|---|
-| [TelperionAI/Qwen3.8-27B-MLA](https://huggingface.co/TelperionAI/Qwen3.8-27B-MLA) | shared latent (Multi-head Latent Attention) | 1 GPU (TP=1) |
-| [TelperionAI/Qwen3.8-27B-GLA-g2](https://huggingface.co/TelperionAI/Qwen3.8-27B-GLA-g2) | latent split into 2 head groups | 2 GPUs (TP=2) |
-| [TelperionAI/Qwen3.8-27B-MLA-FP8](https://huggingface.co/TelperionAI/Qwen3.8-27B-MLA-FP8) | MLA, FP8 weights (31.5 GB) | 1 GPU (TP=1) |
-| [TelperionAI/Qwen3.8-27B-GLA-g2-FP8](https://huggingface.co/TelperionAI/Qwen3.8-27B-GLA-g2-FP8) | GLA-g2, FP8 weights (31.5 GB) | 2 GPUs (TP=2) |
+Two retrofits -- **MLA** (one shared latent; for 1 GPU) and **GLA-g2** (latent split into 2 head groups,
+so it also halves per-GPU KV at TP=2; for 2 GPUs) -- each in four weight formats:
 
-All cache **half the KV bytes per token** of the base model, and all keep the base model's **vision
-tower** and **MTP head** (for speculative decoding). Installing the plugin is all vLLM needs to load
-them; no fork, no extra flags.
+| weights | MLA (TP=1) | GLA-g2 (TP=2) | size | KV cache default |
+|---|---|---|---|---|
+| bf16 | [Qwen3.8-27B-MLA](https://huggingface.co/TelperionAI/Qwen3.8-27B-MLA) | [Qwen3.8-27B-GLA-g2](https://huggingface.co/TelperionAI/Qwen3.8-27B-GLA-g2) | 55.7 GB | bf16 (FP8 calibrated, opt-in) |
+| FP8 | [-MLA-FP8](https://huggingface.co/TelperionAI/Qwen3.8-27B-MLA-FP8) | [-GLA-g2-FP8](https://huggingface.co/TelperionAI/Qwen3.8-27B-GLA-g2-FP8) | 31.5 GB | FP8 |
+| INT4 (AWQ+GPTQ) | [-MLA-INT4](https://huggingface.co/TelperionAI/Qwen3.8-27B-MLA-INT4) | [-GLA-g2-INT4](https://huggingface.co/TelperionAI/Qwen3.8-27B-GLA-g2-INT4) | 22.9 GB | FP8 |
+| EXL3 4.0 bpw | [-MLA-EXL3-4.0bpw](https://huggingface.co/TelperionAI/Qwen3.8-27B-MLA-EXL3-4.0bpw) | [-GLA-g2-EXL3-4.0bpw](https://huggingface.co/TelperionAI/Qwen3.8-27B-GLA-g2-EXL3-4.0bpw) | 17.2 GB | FP8 |
+
+All cache **half the KV bytes per token** of the base model (a quarter with FP8 KV), and all keep the
+base model's **vision tower** and **MTP head** (for speculative decoding). Installing the plugin is all
+vLLM needs to load them; the EXL3 builds also need [cuda-exl3](https://github.com/Zeuss5/cuda-exl3)
+(see [EXL3](#exl3-builds)).
 
 ## Quick start
 
@@ -45,6 +49,39 @@ curl -s http://localhost:8000/v1/chat/completions -H 'Content-Type: application/
 ```
 
 The first start JIT-compiles the fast decode kernel (a few minutes); later starts reuse it.
+
+## FP8 KV cache
+
+Every checkpoint ships calibrated per-layer FP8 KV scales (absmax over a 3.7M-token corpus, measured in
+the served model). The quantized builds use an FP8 cache by default; the bf16 builds use bf16 and switch
+with `--kv-cache-dtype fp8`. Either default can be overridden (`--kv-cache-dtype bfloat16` / `fp8`).
+
+* **Quality:** indistinguishable from run-to-run noise in teacher-forced tests (top-1 disagreement with
+  the bf16-KV run equals that between two bf16-KV runs). The per-head score divisor stored with each row
+  is kept as a 1-byte log2 code (0.8% max error) rather than e4m3 (6%).
+* **Capacity** (one 96 GB GPU, 262k-token requests, vision on): bf16 base 1.9 sequences; MLA bf16 with
+  bf16 / FP8 KV 3.7 / 7.3 (3.8x the base); MLA-FP8 12.7, -INT4 14.5, -EXL3 15.6. At shorter requests the
+  gain is smaller (16k: about 1.5x from FP8 KV) because each sequence also holds a fixed linear-attention state.
+* **Speed:** FP8-cache decode runs on the plugin's Triton kernels (FlashInfer's FP8 MLA kernel is SM90 +
+  DeepSeek dims only), about 15-25% slower at moderate concurrency than the bf16 FlashInfer path.
+
+## EXL3 builds
+
+The EXL3 checkpoints are graft-built from TelperionAI/Qwen3.8-27B-EXL3-4.0bpw-v2 and run on
+**[cuda-exl3](https://github.com/Zeuss5/cuda-exl3)**, a separate vLLM plugin providing the EXL3 runtime
+(batched trellis kernels). Install it next to this one; it compiles CUDA code on install (needs `nvcc`,
+a few minutes):
+
+```bash
+pip install "git+https://github.com/sootaugur/qwen-mla-vllm"
+pip install --no-build-isolation "git+https://github.com/Zeuss5/cuda-exl3"
+vllm serve TelperionAI/Qwen3.8-27B-MLA-EXL3-4.0bpw --reasoning-parser qwen3
+```
+
+On a **24 GB GPU** serve it text-only (`--limit-mm-per-prompt '{"image": 0, "video": 0}'`, FP8 KV is the
+default, no MTP): about 106k tokens of KV at 32k max context, measured under an equivalent memory budget.
+Vision and MTP need more memory than a 24 GB card leaves. The INT4 builds fit a 32 GB card text-only
+(about 250k tokens of KV at 32k context).
 
 ## Requirements
 
@@ -101,7 +138,7 @@ Prefill throughput matches the base model (within 3%).
 
 The models keep the base model's MTP head unchanged, and it drafts for the retrofit as well as it does
 for the base model: the same mean accepted tokens per step (k=3: 1.86 vs 1.82). Decode throughput,
-tokens/s at 1 / 8 / 32 concurrent requests (64 mixed prompts, thinking on, Qwen's recommended sampling,
+tokens/s at 1 / 8 / 32 concurrent requests (64 mixed prompts, thinking on, temperature 0.6, top-p 0.95, top-k 20,
 bf16):
 
 | | no MTP | MTP, k=3 | speedup |
@@ -137,6 +174,7 @@ Nothing is required. Optional environment variables:
 | `QWEN_MLA_DECODE_BACKEND` | `flashinfer` | `triton` disables the FlashInfer fast path |
 | `QWEN_MLA_TWO_PASS` | `1` | `0` disables the two-pass kernel for the 1792 latent |
 | `QWEN_MLA_2P_SCRATCH_MB` | `256` | scratch budget of the two-pass kernel; very long contexts process keys in rounds when exceeded |
+| `QWEN_MLA_FP8_RMS` | `log8` | FP8 cache: format of the per-head score divisor (`log8`, `bf16` = wider rows and no MTP, `e4m3`) |
 | `QWEN_MLA_SPLITK_SCRATCH_MB` | `512` | cap on the Triton decode's split-K scratch; fewer key splits at very large batch x context |
 | `QWEN_MLA_GLA_SHARD` | `1` | `0` keeps the full latent on every GPU for grouped models (A/B testing) |
 | `QWEN_MLA_CACHE` | `~/.cache/qwen-mla` | where the kernel overlay and compiled modules live |
@@ -173,6 +211,9 @@ python tests/test_mrope.py          # CPU only
   shared memory broadcast block"); it completes. Starting two TP=2 servers at the same moment on one
   machine has hung during capture; start them one after another.
 * Decode context parallelism (DCP) is not supported.
+* FP8 KV decode runs on Triton kernels (slower than the bf16 FlashInfer path).
+* The INT4 and EXL3 builds reuse the base model's quantized tensors (their calibration saw the base
+  model's activations); only the 16 attention layers' latent projections come from the retrofit, in bf16.
 * Tested at TP=1 and TP=2. The GLA per-group cache engages when the tensor-parallel size is a multiple
   of the group count (2); at TP=1 GLA-g2 runs like plain MLA. TP=4 should work (each pair of GPUs
   shares a group) but has not been tested.

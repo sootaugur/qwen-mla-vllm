@@ -42,6 +42,9 @@ cache row and kills concat_and_cache_mla inside the CUDA kernel.
 """
 from __future__ import annotations
 
+import functools
+import os
+
 import torch
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata, QueryLenSupport
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -98,7 +101,41 @@ def splitk_reserve_bytes(batch: int, heads: int, lse_dim: int, splits: int) -> i
     return min(full, max(budget, batch * heads * lse_dim * 4))
 
 
-def mla_base_tail(hf, tp_size: int = 1) -> int:
+def mla_kv_fp8(vllm_config=None) -> bool:
+    """True when the KV cache is FP8 (--kv-cache-dtype fp8*): the row layout changes (rms tail as bf16 bytes)."""
+    if vllm_config is None:
+        try:
+            from vllm.config import get_current_vllm_config
+            vllm_config = get_current_vllm_config()
+        except Exception:                      # noqa: BLE001 - outside a config context: assume bf16
+            return False
+    return str(getattr(vllm_config.cache_config, "cache_dtype", "auto")).startswith("fp8")
+
+
+# rms tail formats for an FP8 cache (QWEN_MLA_FP8_RMS):
+#   log8 (default): one byte per head, uint8 code of log2(rms) uniform over [RMS_LOG2_LO, RMS_LOG2_HI]
+#                   -> max relative error 0.8% (bf16: 0.4%, e4m3: 6.25%). Compact rows: the BF16 element
+#                   layout exactly (512/1024/2048 bytes at TP=1), so pages unify with an MTP draft layer.
+#   bf16:           two bytes per head (raw bf16). Wider rows (536/1072/2144); breaks page unification
+#                   with an MTP draft layer (vLLM cannot pad its pages).
+#   e4m3:           one byte per head, scaled with the row like latent and rope. Measured costlier.
+RMS_LOG2_LO, RMS_LOG2_HI = -3.0, 3.0          # rms in [0.125, 8]; observed 0.29 .. 2.1 over 3.7M tokens
+
+
+def mla_fp8_rms_mode() -> str:
+    import os
+    m = os.environ.get("QWEN_MLA_FP8_RMS", "log8")
+    if m not in ("log8", "bf16", "e4m3"):
+        raise ValueError(f"QWEN_MLA_FP8_RMS={m!r}: expected log8, bf16 or e4m3")
+    return m
+
+
+def mla_fp8_rms_bf16() -> bool:
+    """True for the wide FP8 row (raw bf16 rms, two bytes per head)."""
+    return mla_fp8_rms_mode() == "bf16"
+
+
+def mla_base_tail(hf, tp_size: int = 1, fp8: bool = False) -> int:
     """Live cache tail beyond the latent: packed rope (4x64) + one rms scalar per LOCAL head.
 
     The rope block is replicated (k_rope_proj is ReplicatedLinear, so every rank holds all four
@@ -113,7 +150,9 @@ def mla_base_tail(hf, tp_size: int = 1) -> int:
     # 280-dim tail and undo it.
     from .partial_rope import effective_rope_dim
     rope = effective_rope_dim(hf)
-    return mla_rope_span(hf, tp_size) * rope + hf.num_attention_heads // tp_size
+    # FP8 cache: the rms scalars stay bf16 -- e4m3 keeps 3 mantissa bits, up to 6% error on every
+    # logit -- so each takes TWO one-byte cache elements. Rope and latent are e4m3.
+    return mla_rope_span(hf, tp_size) * rope + (hf.num_attention_heads // tp_size) * (2 if (fp8 and mla_fp8_rms_bf16()) else 1)
 
 
 def mla_rope_span(hf, tp_size: int = 1) -> int:
@@ -151,7 +190,7 @@ def mla_local_ranks(hf, tp_size: int = 1) -> dict[int, int]:
     return {int(k): int(v) // g for k, v in hf.mla_ranks.items()}
 
 
-def mla_padded_head_size(hf, kv_lora_rank: int, tp_size: int = 1) -> int:
+def mla_padded_head_size(hf, kv_lora_rank: int, tp_size: int = 1, fp8: bool = False) -> int:
     """Cache row width for a layer, padded so every layer's PAGE divides the largest.
 
     vLLM unifies differing page sizes by scaling block_size -- but only when the largest page is
@@ -169,7 +208,7 @@ def mla_padded_head_size(hf, kv_lora_rank: int, tp_size: int = 1) -> int:
     The padding sits past the rms tail and is never read: the decode kernel bounds its
     attention reads at rms_offset, and prefill slices rope/rms at explicit offsets.
     """
-    tail = mla_base_tail(hf, tp_size)
+    tail = mla_base_tail(hf, tp_size, fp8)
     base = min(mla_local_ranks(hf, tp_size).values()) + tail
     # NOTE on 16-byte alignment. The row width is also the per-token stride, so at TP=2 the
     # smallest rank gives 256 + 268 = 524 elements = 1048 bytes and every odd token row is only
@@ -226,12 +265,12 @@ def mla_padded_head_size(hf, kv_lora_rank: int, tp_size: int = 1) -> int:
     return _pow2(raw)
 
 
-def mla_rank_by_head_size(hf, tp_size: int = 1) -> dict[int, int]:
+def mla_rank_by_head_size(hf, tp_size: int = 1, fp8: bool = False) -> dict[int, int]:
     """padded head_size -> kv_lora_rank. Max on collision: the value sizes a workspace."""
     out: dict[int, int] = {}
     for v in mla_local_ranks(hf, tp_size).values():
         r = int(v)
-        hs = mla_padded_head_size(hf, r, tp_size)
+        hs = mla_padded_head_size(hf, r, tp_size, fp8)
         out[hs] = max(out.get(hs, 0), r)
     return out
 
@@ -248,9 +287,48 @@ class QwenMLATritonImpl(TritonMLAImpl):
     mla_rope_first: int = 0       # first GLOBAL rope group this rank caches
     mla_packed_rope: int = 0      # width of the packed rope block (256), EXCLUDING rms + pad
 
+    mla_kv_fp8: bool = False        # FP8 cache: rms tail stored as raw bf16 bytes after the rope block
+
     def _mla_kernel(self, *args, **kwargs):
         kwargs["rms_offset"] = self.rms_offset
+        kwargs["rms_bf16"] = self.mla_kv_fp8 and mla_fp8_rms_bf16()
+        kwargs["rms_log8"] = self.mla_kv_fp8 and mla_fp8_rms_mode() == "log8"
         return mla_decode_attention_fwd(*args, **kwargs)
+
+    def do_kv_cache_update(self, kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale):
+        """FP8 cache write: [latent e4m3 | rope e4m3 | rms as bf16 bytes | pad].
+
+        vLLM's concat_and_cache_mla would quantize the rms scalars to e4m3 along with the rope. This
+        writes the same bytes for latent and rope (x / scale, saturated, round-to-nearest e4m3) and the
+        rms as two bytes each. Device ops with static shapes only (runs inside CUDA graphs); padding
+        tokens (slot -1) are redirected to slot 0, which belongs to vLLM's never-used null block.
+        """
+        if (self.rms_offset < 0 or not str(kv_cache_dtype).startswith("fp8")
+                or mla_fp8_rms_mode() == "e4m3"):
+            return super().do_kv_cache_update(kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale)
+        if kv_cache.numel() == 0:
+            return
+        # Token count = slot count, as in vLLM's kernel: kv_c / k_pe may carry CUDA-graph padding rows
+        # beyond the slots (measured: 64 rows, 61 slots).
+        slots = slot_mapping.flatten()
+        n = slots.shape[0]
+        kv_c_normed = kv_c_normed[:n]
+        k_pe = k_pe.reshape(k_pe.shape[0], -1)[:n]
+        pr, nh = self.mla_packed_rope, self.mla_local_heads
+        inv = (1.0 / k_scale.float()).reshape(())
+        f8 = torch.float8_e4m3fn
+        lat = (kv_c_normed.float() * inv).clamp_(-448.0, 448.0).to(f8).view(torch.uint8)
+        rope = (k_pe[:, :pr].float() * inv).clamp_(-448.0, 448.0).to(f8).view(torch.uint8)
+        if mla_fp8_rms_mode() == "log8":
+            code = (k_pe[:, pr:pr + nh].float().clamp_min(1e-30).log2() - RMS_LOG2_LO) \
+                * (255.0 / (RMS_LOG2_HI - RMS_LOG2_LO))
+            rms = code.round_().clamp_(0, 255).to(torch.uint8)
+        else:
+            rms = k_pe[:, pr:pr + nh].to(torch.bfloat16).contiguous().view(torch.uint8)
+        row = torch.cat([lat, rope, rms], dim=-1)
+        flat = kv_cache.view(torch.uint8).view(-1, kv_cache.shape[-1])
+        slots = slots.clamp(min=0).long()
+        flat[:, :row.shape[1]].index_copy_(0, slots, row)
 
     def _mla_group_of_local_head(self, n_local: int, device) -> torch.Tensor:
         """Rope group owned by each rank-local head. See TP CORRECTNESS in the module docstring."""
@@ -328,7 +406,10 @@ class QwenMLATritonImpl(TritonMLAImpl):
         # parent resolves `ops.gather_and_maybe_dequant_cache` at call time.
         import vllm._custom_ops as _ops
         orig = _ops.gather_and_maybe_dequant_cache
-        _ops.gather_and_maybe_dequant_cache = gather_cache_torch
+        _ops.gather_and_maybe_dequant_cache = (
+            functools.partial(gather_cache_torch, mla_rms=(self.rms_offset, self.mla_local_heads,
+                                                          mla_fp8_rms_mode()))
+            if self.mla_kv_fp8 else gather_cache_torch)
         try:
             return super().forward_mha(q, *args, **kwargs)
         finally:
@@ -412,10 +493,11 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
         # Rows are padded for page unification, so head_size - tail OVERSTATES the rank. Look it
         # up from the allocation instead; the group's head_size identifies it exactly.
         tp = vllm_config.parallel_config.tensor_parallel_size
-        rank = mla_rank_by_head_size(hf, tp).get(kv_cache_spec.head_size)
+        fp8 = mla_kv_fp8(vllm_config)
+        rank = mla_rank_by_head_size(hf, tp, fp8).get(kv_cache_spec.head_size)
         if rank is None:
             raise ValueError(f"no MLA rank maps to head_size {kv_cache_spec.head_size} "
-                             f"(known: {sorted(mla_rank_by_head_size(hf, tp))})")
+                             f"(known: {sorted(mla_rank_by_head_size(hf, tp, fp8))})")
 
         had = hasattr(hf, "kv_lora_rank")
         prev = getattr(hf, "kv_lora_rank", None)
@@ -486,7 +568,11 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
         # The kernel stages the rms tail with 16-byte cp.async; a start that is only 8-byte aligned
         # (partial rope at TP=2: rank + 116) is handled in-kernel by RMS_SHIFT. Anything coarser is not.
         rms_aligned = ((rank + win) * itemsize) % 8 == 0
-        if (fi_decode.cp_async_safe(kv_cache_spec.head_size, page, rank, off, itemsize)
+        if fp8:
+            # The patched flashinfer kernel reads bf16 rows; flashinfer itself supports FP8 MLA only on
+            # SM90 with DeepSeek's dims. FP8-cache decode runs on the Triton kernels.
+            fi_decode._announce("MLA decode: FP8 KV cache -- decode uses the Triton kernels")
+        elif (fi_decode.cp_async_safe(kv_cache_spec.head_size, page, rank, off, itemsize)
                 and rank + off + kpe <= kv_cache_spec.head_size and rms_aligned):
             self._mla_fi_ok = True
             sched = vllm_config.scheduler_config

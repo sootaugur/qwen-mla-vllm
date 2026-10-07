@@ -329,6 +329,8 @@ def _fwd_grouped_kernel_stage1(
     logit_cap: tl.constexpr,
     RMS_OFFSET: tl.constexpr,
     PAGE_ALIGNED: tl.constexpr,
+    RMS_BF16: tl.constexpr,
+    RMS_LOG8: tl.constexpr,
     MLA_RELOAD_V: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
@@ -465,16 +467,41 @@ def _fwd_grouped_kernel_stage1(
                 # rms(key_h) lives in K_Buffer at [RMS_OFFSET + head] for each key token, so it
                 # is fetched with the same paged offsets as k. Shape [BLOCK_H, BLOCK_N] matches
                 # qk exactly. Guard against zero for masked-out lanes.
-                offs_buf_rms = (
-                    kv_off_k[None, :]
-                    + cur_kv_head * stride_buf_kh
-                    + (RMS_OFFSET + cur_head)[:, None]
-                )
-                rms = tl.load(
-                    K_Buffer + offs_buf_rms,
-                    mask=mask_h[:, None] & (offs_n[None, :] < split_kv_end),
-                    other=1.0,
-                ).to(tl.float32)
+                if RMS_LOG8:
+                    # FP8 cache, compact row: rms as a uint8 code of log2(rms) over [-3, 3] (mla_impl)
+                    rms_row = (K_Buffer + kv_off_k + cur_kv_head * stride_buf_kh + RMS_OFFSET).to(
+                        tl.pointer_type(tl.uint8))
+                    code = tl.load(
+                        rms_row[None, :] + cur_head[:, None],
+                        mask=mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                        other=128,
+                    ).to(tl.float32)
+                    rms = tl.exp2(-3.0 + code * (6.0 / 255.0))
+                elif RMS_BF16:
+                    # FP8 cache: the rms tail is kept as raw bf16 (2 bytes per head) -- e4m3's 3-bit
+                    # mantissa would put up to 6% error on every logit. Reinterpret the row's tail.
+                    rms_row = (K_Buffer + kv_off_k + cur_kv_head * stride_buf_kh + RMS_OFFSET).to(
+                        tl.pointer_type(tl.bfloat16))
+                    rms = tl.load(
+                        rms_row[None, :] + cur_head[:, None],
+                        mask=mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                        other=1.0,
+                    ).to(tl.float32)
+                else:
+                    offs_buf_rms = (
+                        kv_off_k[None, :]
+                        + cur_kv_head * stride_buf_kh
+                        + (RMS_OFFSET + cur_head)[:, None]
+                    )
+                    rms_raw = tl.load(
+                        K_Buffer + offs_buf_rms,
+                        mask=mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                        other=1.0,
+                    )
+                    if rms_raw.dtype.is_fp8():          # compact FP8 row: rms is e4m3 x k_scale
+                        rms = rms_raw.to(tl.float32) * ks
+                    else:
+                        rms = rms_raw.to(tl.float32)
                 qk = qk / tl.where(rms > 0, rms, 1.0)
 
             qk *= sm_scale
@@ -576,11 +603,13 @@ def _fwd_grouped_kernel_stage1(
 def _mla2p_scores_kernel(
     Q, K_Buffer, S, sm_scale, Req_to_tokens, B_Seqlen,
     stride_req_b, stride_qb, stride_qh, stride_kp, stride_kt, stride_sb, stride_sh, stride_ss,
-    chunk_start,
+    chunk_start, k_scale,
     H: tl.constexpr, Lv: tl.constexpr, Lk: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr,
     DC: tl.constexpr, BLOCK_DPE: tl.constexpr, NUM_KV_SPLITS: tl.constexpr, PAGE_SIZE: tl.constexpr,
-    RMS_OFFSET: tl.constexpr, logit_cap: tl.constexpr, CHUNK: tl.constexpr,
+    RMS_OFFSET: tl.constexpr, logit_cap: tl.constexpr, CHUNK: tl.constexpr, RMS_BF16: tl.constexpr,
+    RMS_LOG8: tl.constexpr,
 ):
+    ks = tl.load(k_scale)
     b = tl.program_id(0)
     split = tl.program_id(1)
     heads = tl.arange(0, BLOCK_H)
@@ -604,6 +633,8 @@ def _mla2p_scores_kernel(
                         mask=mh[:, None] & md[None, :], other=0.0, cache_modifier=".ca")
             k = tl.load(K_Buffer + kv_off[None, :] + offs_d[:, None],
                         mask=mn[None, :] & md[:, None], other=0.0, cache_modifier=".cg")
+            if k.dtype.is_fp8():
+                k = k.to(tl.float32) * ks
             qk += tl.dot(q, k.to(q.dtype))
         if BLOCK_DPE > 0:
             offs_p = Lv + tl.arange(0, BLOCK_DPE)
@@ -612,10 +643,26 @@ def _mla2p_scores_kernel(
                           mask=mh[:, None] & mp[None, :], other=0.0, cache_modifier=".ca")
             kpe = tl.load(K_Buffer + kv_off[None, :] + offs_p[:, None],
                           mask=mn[None, :] & mp[:, None], other=0.0, cache_modifier=".cg")
+            if kpe.dtype.is_fp8():
+                kpe = kpe.to(tl.float32) * ks
             qk += tl.dot(qpe, kpe.to(qpe.dtype))
         if RMS_OFFSET >= 0:
-            rms = tl.load(K_Buffer + kv_off[None, :] + (RMS_OFFSET + heads)[:, None],
-                          mask=mh[:, None] & mn[None, :], other=1.0).to(tl.float32)
+            if RMS_LOG8:
+                rms_row = (K_Buffer + kv_off + RMS_OFFSET).to(tl.pointer_type(tl.uint8))
+                code = tl.load(rms_row[None, :] + heads[:, None],
+                               mask=mh[:, None] & mn[None, :], other=128).to(tl.float32)
+                rms = tl.exp2(-3.0 + code * (6.0 / 255.0))
+            elif RMS_BF16:
+                rms_row = (K_Buffer + kv_off + RMS_OFFSET).to(tl.pointer_type(tl.bfloat16))
+                rms = tl.load(rms_row[None, :] + heads[:, None],
+                              mask=mh[:, None] & mn[None, :], other=1.0).to(tl.float32)
+            else:
+                rms_raw = tl.load(K_Buffer + kv_off[None, :] + (RMS_OFFSET + heads)[:, None],
+                                  mask=mh[:, None] & mn[None, :], other=1.0)
+                if rms_raw.dtype.is_fp8():
+                    rms = rms_raw.to(tl.float32) * ks
+                else:
+                    rms = rms_raw.to(tl.float32)
             qk = qk / tl.where(rms > 0, rms, 1.0)
         qk *= sm_scale
         if logit_cap > 0:
@@ -628,7 +675,7 @@ def _mla2p_scores_kernel(
 def _mla2p_pv_kernel(
     S, K_Buffer, Att_Out, Req_to_tokens, B_Seqlen, Lse_In, Lse_Out,
     stride_req_b, stride_kp, stride_kt, stride_sb, stride_sh, stride_ss, stride_ob, stride_oh, stride_os,
-    stride_lb, stride_lh, chunk_start,
+    stride_lb, stride_lh, chunk_start, k_scale,
     H: tl.constexpr, Lv: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr, DVC: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr, PAGE_SIZE: tl.constexpr, CHUNK: tl.constexpr, MERGE: tl.constexpr,
     LSE_TO_OUT: tl.constexpr,
@@ -664,6 +711,8 @@ def _mla2p_pv_kernel(
             kv_off = page * stride_kp + ((start_n % PAGE_SIZE) + tl.arange(0, BLOCK_N)) * stride_kt
             v = tl.load(K_Buffer + kv_off[:, None] + offs_dv[None, :],
                         mask=mn[:, None] & mdv[None, :], other=0.0, cache_modifier=".cg")
+            if v.dtype.is_fp8():
+                v = (v.to(tl.float32) * tl.load(k_scale)).to(tl.bfloat16)
             n_max = tl.maximum(tl.max(sc, 1), e_max)
             re = tl.exp(e_max - n_max)
             pr = tl.exp(sc - n_max[:, None])
@@ -701,7 +750,8 @@ def _small_smem(device) -> bool:
 
 
 def _decode_mla_two_pass(q, k_buffer, att_out, req_to_token, b_seq_len, num_kv_splits, sm_scale,
-                         page_size, rms_offset, logit_cap, Lk, Lv):
+                         page_size, rms_offset, logit_cap, Lk, Lv, k_scale=None, rms_bf16=False,
+                         rms_log8=False):
     """Wide-latent MLA decode as scores pass + P.V pass (see the comment above the kernels).
 
     Scores are fp32 (bf16 would distort exp() at |logit| ~ 30) in a scratch of [batch, heads, splits,
@@ -738,21 +788,23 @@ def _decode_mla_two_pass(q, k_buffer, att_out, req_to_token, b_seq_len, num_kv_s
         lse_bufs = [att_out, att_out]                                    # unused (LSE_TO_OUT)
 
     kp, kt = _page_stride(k_buffer, page_size), k_buffer.stride(-3)
+    if k_scale is None:
+        k_scale = torch.ones((), dtype=torch.float32, device=q.device)
     for r in range(rounds):
         cs = r * CHUNK
         _mla2p_scores_kernel[(B, num_kv_splits)](
             q, k_buffer, S, sm_scale, req_to_token, b_seq_len,
             req_to_token.stride(0), q.stride(0), q.stride(1), kp, kt, S.stride(0), S.stride(1), S.stride(2),
-            cs,
+            cs, k_scale,
             H=H, Lv=Lv, Lk=Lk, BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, DC=DC, BLOCK_DPE=BLOCK_DPE,
             NUM_KV_SPLITS=num_kv_splits, PAGE_SIZE=page_size, RMS_OFFSET=rms_offset, logit_cap=logit_cap,
-            CHUNK=CHUNK, num_warps=WA, num_stages=SA)
+            CHUNK=CHUNK, RMS_BF16=rms_bf16, RMS_LOG8=rms_log8, num_warps=WA, num_stages=SA)
         lin, lout = lse_bufs[r % 2], lse_bufs[(r + 1) % 2]
         _mla2p_pv_kernel[(B, num_kv_splits, triton.cdiv(Lv, DVC))](
             S, k_buffer, att_out, req_to_token, b_seq_len, lin, lout,
             req_to_token.stride(0), kp, kt, S.stride(0), S.stride(1), S.stride(2),
             att_out.stride(0), att_out.stride(1), att_out.stride(2),
-            lin.stride(0) if rounds > 1 else 0, lin.stride(1) if rounds > 1 else 0, cs,
+            lin.stride(0) if rounds > 1 else 0, lin.stride(1) if rounds > 1 else 0, cs, k_scale,
             H=H, Lv=Lv, BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, DVC=DVC, NUM_KV_SPLITS=num_kv_splits,
             PAGE_SIZE=page_size, CHUNK=CHUNK, MERGE=r > 0, LSE_TO_OUT=rounds == 1,
             num_warps=WB, num_stages=SB)
@@ -779,6 +831,8 @@ def _decode_grouped_att_m_fwd(
     v_scale,
     is_mla=False,
     rms_offset=-1,
+    rms_bf16=False,
+    rms_log8=False,
 ):
     # with is_mla there is only a single c_kv in smem.
     # could increase BLOCK or num_stages.
@@ -795,7 +849,8 @@ def _decode_grouped_att_m_fwd(
     if (is_mla and not is_hip_ and Lv >= 1536 and _small_smem(q.device)
             and _os2.environ.get("QWEN_MLA_TWO_PASS", "1") != "0" and page_size % 16 == 0):
         return _decode_mla_two_pass(q, k_buffer, att_out, Req_to_tokens, B_Seqlen, num_kv_splits,
-                                    sm_scale, page_size, rms_offset, logit_cap, Lk, Lv)
+                                    sm_scale, page_size, rms_offset, logit_cap, Lk, Lv,
+                                    k_scale=k_scale, rms_bf16=rms_bf16, rms_log8=rms_log8)
 
     # Align tile dimensions with latent rank for MLA to avoid shape mismatch.
     if is_mla:
@@ -941,6 +996,8 @@ def _decode_grouped_att_m_fwd(
                 logit_cap=logit_cap,
                 RMS_OFFSET=rms_offset,
                 PAGE_ALIGNED=PAGE_ALIGNED,
+                RMS_BF16=rms_bf16,
+                RMS_LOG8=rms_log8,
                 # At BLOCK_DV 2048 the tl.trans of the K tile is large enough that re-loading V from
                 # L1/L2 beats transposing it (8.31 -> 7.87 ms at rank 1792); at 1024 the transpose still
                 # wins (3.70 vs 5.31), so this is on only for the widest layer.
@@ -1137,6 +1194,8 @@ def decode_attention_fwd_grouped(
     v_scale=None,
     is_mla=False,
     rms_offset=-1,
+    rms_bf16=False,
+    rms_log8=False,
 ):
     align_n = _decode_grouped_att_m_fwd(
         q,
@@ -1153,6 +1212,8 @@ def decode_attention_fwd_grouped(
         v_scale,
         is_mla=is_mla,
         rms_offset=rms_offset,
+        rms_bf16=rms_bf16,
+        rms_log8=rms_log8,
     )
     _decode_softmax_reducev_fwd(
         attn_logits, q, o, lse, v_buffer, b_seq_len, num_kv_splits, align_n=align_n
@@ -1176,6 +1237,8 @@ def decode_attention_fwd(
     v_scale=None,
     is_mla=False,
     rms_offset=-1,
+    rms_bf16=False,
+    rms_log8=False,
 ):
     assert num_kv_splits == attn_logits.shape[2]
 
@@ -1223,4 +1286,6 @@ def decode_attention_fwd(
             v_scale,
             is_mla=is_mla,
             rms_offset=rms_offset,
+            rms_bf16=rms_bf16,
+            rms_log8=rms_log8,
         )

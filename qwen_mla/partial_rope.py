@@ -74,3 +74,18 @@ def patch_partial_rope(rotary_emb, keep, mrd: int, theta: float) -> None:
         raise ValueError(f"partial-rope cache {tuple(new.shape)} != {tuple(cache.shape)}; "
                          f"rotary was built at the wrong width for keep={len(keep)}")
     cache.copy_(new)
+
+
+def rope_perm(model_rope_dim: int, head_dim: int, keep) -> list[int]:
+    """The retrofit's per-head query/key dim permutation: kept rope pairs first, then dropped, then nope.
+
+    Identical to mla_retrofit.config.build_rope_perm, which produced the released checkpoints: the
+    student's q_proj is the base q_proj with this permutation applied to the q half of every head
+    (verified bit-exact on all 16 layers), and its q_norm weight is base q_norm[perm].
+    """
+    half = model_rope_dim // 2
+    keep = [int(k) for k in keep]
+    drop = [s for s in range(half) if s not in keep]
+    perm = keep + [s + half for s in keep] + drop + [s + half for s in drop] + list(range(model_rope_dim, head_dim))
+    assert sorted(perm) == list(range(head_dim))
+    return perm

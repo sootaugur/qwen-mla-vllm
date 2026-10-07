@@ -41,7 +41,8 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from .partial_rope import patch_partial_rope, rope_keep_from_config
 
-from .mla_impl import QwenMLATritonBackend, chunked_workspace_rows, mla_gla_split, mla_padded_head_size
+from .mla_impl import (QwenMLATritonBackend, chunked_workspace_rows, mla_fp8_rms_bf16, mla_gla_split, mla_kv_fp8,
+                       mla_padded_head_size)
 
 
 class Qwen3_5MLAAttention(nn.Module):
@@ -102,9 +103,14 @@ class Qwen3_5MLAAttention(nn.Module):
         # rms_offset + num_heads) and exists only so this layer's cache page divides the
         # largest layer's -- without it vLLM pads every row to the widest and the served
         # compression collapses to 1x. See mla_padded_head_size.
-        self.head_size = mla_padded_head_size(config, kv_lora_rank, tp)
+        # FP8 cache: rms stays bf16 = 2 one-byte elements per head (see mla_base_tail), so the tail widens.
+        self.kv_fp8 = mla_kv_fp8()
+        self.head_size = mla_padded_head_size(config, kv_lora_rank, tp, self.kv_fp8)
         self.declared_rope = self.head_size - self.kv_lora_rank
+        # k_pe keeps the BF16 layout [rope | rms (one element per head) | pad]; under FP8 the cache write
+        # spreads rms over 2 bytes per head, which is what the extra tail width is for.
         self.rope_pad = self.declared_rope - self.packed_rope - self.num_heads
+        assert self.declared_rope - self.packed_rope - self.num_heads * (2 if (self.kv_fp8 and mla_fp8_rms_bf16()) else 1) >= 0
         assert self.rope_pad >= 0, f"padded head_size {self.head_size} too small"
 
         self.q_proj = ColumnParallelLinear(config.hidden_size,
@@ -152,6 +158,22 @@ class Qwen3_5MLAAttention(nn.Module):
         # rotary frequency takes ONE of the three, by the teacher's own section layout. Text tokens
         # have t == h == w, so this matters only for image/video tokens. The table maps each column
         # of our (kept-frequency) cos/sin cache to its section, by ORIGINAL frequency index.
+        # KV-cache calibration (QWEN_MLA_KV_OBSERVE=1): running maxima of what this layer writes into
+        # the cache -- [|latent|, |packed rope|, max rms, max 1/rms] -- kept on device so the update is a
+        # plain in-place op (works under torch.compile and CUDA graphs). Read and reset from outside.
+        import os as _os
+        self._kv_observe = _os.environ.get("QWEN_MLA_KV_OBSERVE") == "1"
+        if self._kv_observe:
+            self.register_buffer("_kv_stats", torch.zeros(4, dtype=torch.float32), persistent=False)
+        # mla_q_proj_base_layout: the checkpoint's q_proj is the BASE model's (rows not permuted), as when
+        # the base model's quantized q_proj is reused unchanged -- EXL3's output Hadamard rules out permuting
+        # an encoded tensor's rows. Apply the retrofit's rope permutation to q at runtime instead (exact).
+        if getattr(config, "mla_q_proj_base_layout", False) and self.rope_keep is not None:
+            from .partial_rope import rope_perm
+            self.register_buffer("_q_perm", torch.tensor(rope_perm(self.model_rope_dim, self.head_dim,
+                                                                    self.rope_keep)), persistent=False)
+        else:
+            self._q_perm = None
         self.mrope_section = rp.get("mrope_section")
         if self.mrope_section:
             s0, s1, s2 = self.mrope_section
@@ -177,6 +199,9 @@ class Qwen3_5MLAAttention(nn.Module):
         # The profile run simulates the context up-projection at this many rows; match the builder.
         self.mla_attn._chunked_prefill_workspace_size = chunked_workspace_rows(self.mla_attn._vllm_config)
         self.mla_attn.impl.rms_offset = self.rms_offset
+        self.mla_attn.impl.mla_kv_fp8 = self.kv_fp8
+        if self.kv_fp8:
+            self._install_kv_scale(config, prefix)
         self.mla_attn.impl.mla_local_heads = self.num_heads   # rms tail is rank-local
         self.mla_attn.impl.mla_rope_dim = self.rope_dim
         self.mla_attn.impl.mla_packed_rope = self.packed_rope
@@ -214,6 +239,8 @@ class Qwen3_5MLAAttention(nn.Module):
 
         qg, _ = self.q_proj(hidden_states)
         q, gate = torch.chunk(qg.view(n, nh, hd * 2), 2, dim=-1)
+        if self._q_perm is not None:                       # base-layout q_proj (e.g. reused EXL3 tensors)
+            q = q.index_select(-1, self._q_perm)
         q = self.q_norm(q)
 
         c, _ = self.kv_a_proj(hidden_states)               # [n, r] -- the cached latent
@@ -262,6 +289,10 @@ class Qwen3_5MLAAttention(nn.Module):
                 + torch.arange(rd, device=q.device)[None, :])
         q_pe.scatter_(2, slot.unsqueeze(0).expand(n, -1, -1), q_rot)
         k_win = k_rot[:, self.rope_first:self.rope_first + self.rope_span]
+        if self._kv_observe:
+            st = torch.stack([c.abs().amax().float(), k_win.abs().amax().float(),
+                              rms.amax().float(), rms.reciprocal().amax().float()])
+            torch.maximum(self._kv_stats, st, out=self._kv_stats)
         parts = [k_win.reshape(n, self.packed_rope), rms.to(k_rot.dtype)]
         if self.rope_pad:                                  # page-alignment padding, never read
             parts.append(k_rot.new_zeros(n, self.rope_pad))
@@ -273,6 +304,37 @@ class Qwen3_5MLAAttention(nn.Module):
         out, _ = self.o_proj(attn_out)
         return out
 
+
+    def _install_kv_scale(self, config, prefix):
+        """Per-layer FP8 KV scale from config `mla_kv_cache_scales` ({layer index: amax / 448}).
+
+        The BF16 checkpoints have no quantization config, so vLLM has nowhere to load k_scale from; and
+        where a kv-cache quant method exists it resets the scale to 1.0 in process_weights_after_loading.
+        So apply ours AFTER that step, by wrapping this layer's own hook. One scale covers the whole row
+        (vLLM's MLA kernels pass k_scale for latent and rope alike); the rms tail is not quantized.
+        """
+        scales = getattr(config, "mla_kv_cache_scales", None) or {}
+        layer = extract_layer_index(prefix)
+        s = scales.get(str(layer), scales.get(layer)) if isinstance(scales, dict) else None
+        if s is None:
+            import sys
+            print(f"[qwen-mla] FP8 KV cache but no calibrated scale for layer {layer} "
+                  f"(config mla_kv_cache_scales); using 1.0", file=sys.stderr, flush=True)
+            return
+        attn, orig = self.mla_attn, self.mla_attn.process_weights_after_loading
+        s = float(s)
+
+        def process_weights_after_loading(*args, **kwargs):
+            out = orig(*args, **kwargs)
+            for name in ("_k_scale", "_v_scale"):
+                t = getattr(attn, name, None)
+                if isinstance(t, torch.Tensor):
+                    t.fill_(s)
+            for name in ("_k_scale_float", "_v_scale_float"):
+                if hasattr(attn, name):
+                    setattr(attn, name, s)
+            return out
+        attn.process_weights_after_loading = process_weights_after_loading
 
     def _mrope_rotate(self, positions, q_r, k_r):
         """Neox rotation of [n, heads, rd] q and k with per-frequency (t, h, w) positions."""
@@ -408,11 +470,21 @@ class Qwen3_5MLAForCausalLM(Qwen3_5ForCausalLM):
             _q35.Qwen3_5Model = orig
 
     def load_weights(self, weights):
-        """Consume k_up_proj / v_up_proj into kv_b_proj instead of loading them directly."""
+        """Consume k_up_proj / v_up_proj into kv_b_proj instead of loading them directly.
+
+        May be called SEVERAL times: a multimodal wrapper's loader groups the checkpoint by top-level
+        prefix and calls this once per contiguous run of language-model tensors (a checkpoint whose
+        shards interleave vision and language tensors arrives in pieces). So pending tensors persist
+        across calls, each layer's kv_b_proj is built as soon as its pair is complete, and the
+        all-layers check runs after loading (process_weights_after_loading).
+        """
         # Keyed by (layer index, kind) parsed from the name rather than by a full name built
         # from an assumed prefix: this checkpoint's tensors are model.language_model.layers.N.*,
         # and matching "model.layers.N.*" found nothing while looking like a missing-weight bug.
-        held: dict[tuple[int, str], torch.Tensor] = {}
+        if not hasattr(self, "_mla_held"):
+            self._mla_held: dict[tuple[int, str], torch.Tensor] = {}
+            self._mla_built: set[int] = set()
+        held = self._mla_held
         pat = re.compile(r"\.layers\.(\d+)\.self_attn\.(k_up_proj|v_up_proj)\.weight$")
 
         def _filter(ws):
@@ -424,20 +496,24 @@ class Qwen3_5MLAForCausalLM(Qwen3_5ForCausalLM):
                 yield name, w
 
         loaded = super().load_weights(_filter(weights))
-        built = 0
         for layer in self.model.layers:
             attn = getattr(layer, "self_attn", None)
             if not isinstance(attn, Qwen3_5MLAAttention):
                 continue
             i = extract_layer_index(attn.mla_attn.layer_name.rsplit(".attn", 1)[0])
-            k, v = held.get((i, "k_up_proj")), held.get((i, "v_up_proj"))
-            if k is None or v is None:
-                raise RuntimeError(f"layer {i}: missing k_up/v_up in the checkpoint "
-                                   f"(held layers: {sorted({j for j, _ in held})}); "
-                                   f"kv_b_proj cannot be built")
+            if i in self._mla_built or (i, "k_up_proj") not in held or (i, "v_up_proj") not in held:
+                continue
+            k, v = held.pop((i, "k_up_proj")), held.pop((i, "v_up_proj"))
             attn.build_kv_b_from_up_projections(k.to(torch.float32), v.to(torch.float32))
-            built += 1
-        if built == 0:
-            raise RuntimeError("no MLA layers received kv_b_proj weights")
-        print(f"[qwen-mla] built kv_b_proj for {built} layers from k_up/v_up", flush=True)
+            self._mla_built.add(i)
         return loaded
+
+    def process_weights_after_loading(self):
+        want = {extract_layer_index(l.self_attn.mla_attn.layer_name.rsplit(".attn", 1)[0])
+                for l in self.model.layers if isinstance(getattr(l, "self_attn", None), Qwen3_5MLAAttention)}
+        built = getattr(self, "_mla_built", set())
+        if want - built:
+            raise RuntimeError(f"MLA layers {sorted(want - built)}: missing k_up/v_up in the checkpoint; "
+                               f"kv_b_proj cannot be built")
+        print(f"[qwen-mla] built kv_b_proj for {len(built)} layers from k_up/v_up", flush=True)
+        getattr(super(), "process_weights_after_loading", lambda: None)()

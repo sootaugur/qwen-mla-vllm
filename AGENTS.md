@@ -38,9 +38,17 @@ vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-p
   decoding, 1.4-1.9x faster decode). Omit it if the user wants the plainest setup.
 * The models accept images like the base model. If the user only needs text, add
   `--limit-mm-per-prompt '{"image": 0, "video": 0}'`.
-* FP8 weights (about 31 GB instead of 56 GB; same KV cache): use `TelperionAI/Qwen3.8-27B-MLA-FP8` or
-  `TelperionAI/Qwen3.8-27B-GLA-g2-FP8` with the same flags. They need a GPU with FP8 support (Hopper or
-  Blackwell).
+* Pick the weight format by VRAM per GPU (MLA for 1 GPU, GLA-g2 for 2):
+  bf16 `Qwen3.8-27B-MLA` (55.7 GB), `-MLA-FP8` (31.5 GB), `-MLA-INT4` (22.9 GB),
+  `-MLA-EXL3-4.0bpw` (17.2 GB). Same names with `GLA-g2` for two GPUs. FP8 needs Hopper or Blackwell.
+* The quantized builds default to an FP8 KV cache (calibrated); bf16 builds default to bf16 KV and take
+  `--kv-cache-dtype fp8` for about 2x the capacity at long context.
+* **EXL3 builds need a second plugin**, cuda-exl3 (https://github.com/Zeuss5/cuda-exl3). Install it after
+  this one: `pip install --no-build-isolation "git+https://github.com/Zeuss5/cuda-exl3"` (compiles CUDA
+  code; needs `nvcc`; takes a few minutes).
+* **24 GB GPU:** use `TelperionAI/Qwen3.8-27B-MLA-EXL3-4.0bpw` text-only:
+  `--limit-mm-per-prompt '{"image": 0, "video": 0}' --max-model-len 32768`, no `--speculative-config`.
+  **32 GB:** `-MLA-INT4` with the same flags.
 * If the GPUs are connected only over PCIe (no NVLink: RTX PRO, GeForce), add
   `--disable-custom-all-reduce`. Without it, multi-GPU startup can hang.
 * The first start JIT-compiles a CUDA kernel and can take several minutes. Do not treat a slow
