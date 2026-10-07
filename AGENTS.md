@@ -34,8 +34,10 @@ Two GPUs:
 vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-parser qwen3
 ```
 
-* Recommended: add `--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'` (MTP speculative
-  decoding, 1.4-1.9x faster decode). Omit it if the user wants the plainest setup.
+* Optional: `--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'` (MTP speculative decoding).
+  On an RTX PRO 6000 it sped up the bf16 and FP8 builds (1.3-1.7x at low concurrency) but not the INT4 or
+  EXL3 builds. The benefit depends on the GPU (likely larger on lower-bandwidth cards), so leave it off
+  unless the user asks, or measure first.
 * The models accept images like the base model. If the user only needs text, add
   `--limit-mm-per-prompt '{"image": 0, "video": 0}'`.
 * Pick the weight format by VRAM per GPU (MLA for 1 GPU, GLA-g2 for 2):

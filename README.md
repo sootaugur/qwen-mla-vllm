@@ -37,7 +37,7 @@ vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-p
 # PCIe-only GPUs (no NVLink: RTX PRO, GeForce): add --disable-custom-all-reduce
 ```
 
-`--speculative-config` turns on MTP speculative decoding (optional; see [below](#speculative-decoding-mtp)).
+`--speculative-config` turns on MTP speculative decoding (optional\*; see [below](#speculative-decoding-mtp)).
 Images work as with the base model (OpenAI `image_url` content). For text-only serving, add
 `--limit-mm-per-prompt '{"image": 0, "video": 0}'` to skip reserving memory for the vision encoder.
 
@@ -134,7 +134,7 @@ RTX PRO 6000 (Blackwell), bf16 weights and KV, vLLM 0.27.1, 16k-token prompts, 2
 
 Prefill throughput matches the base model (within 3%).
 
-### Speculative decoding (MTP)
+### Speculative decoding (MTP)\*
 
 The models keep the base model's MTP head unchanged, and it drafts for the retrofit as well as it does
 for the base model: the same mean accepted tokens per step (k=3: 1.86 vs 1.82). Decode throughput,
@@ -151,6 +151,12 @@ bf16):
 The speedup is smaller than the base model's because a verify step currently reads the latent cache once
 per draft token; a single causal pass per request is planned. Greedy output with MTP differs from greedy
 output without it no more than it does for the base model.
+
+\*Measured on one GPU type (RTX PRO 6000, very high memory bandwidth); the table above uses a bf16 KV cache.
+With the FP8 KV cache, k=3 gave 1.6x (bf16 build) and 1.3x (FP8 build) at one concurrent request, but did
+not speed up the INT4 or EXL3 builds there (their weights are already cheap to read; each verify step has a
+fixed cost on the FP8-cache path). Where weight reads dominate decode, on lower-bandwidth GPUs, MTP is
+likely to help more. Measure it on your hardware.
 
 ### Vision
 
