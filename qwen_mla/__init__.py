@@ -225,6 +225,8 @@ def register():
     _prefix_cache_scheduler_fixes()
     from .mamba_align_free import patch_mamba_align_free
     patch_mamba_align_free()
+    from .gdn_meta_cache import patch_gdn_metadata_cache
+    patch_gdn_metadata_cache()
 
 
 def _profile_prefill_context_scratch():

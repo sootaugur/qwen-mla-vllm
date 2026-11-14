@@ -103,8 +103,8 @@ vllm serve TelperionAI/Qwen3.8-27B-GLA-g2-EXL3-4.0bpw --tensor-parallel-size 2 -
   cache blocks (the block size on this setup): with prefix caching, prefill chunks end on block
   boundaries, so a budget that is not a multiple of the block wastes the remainder of every chunk.
 * `--enable-prefix-caching --mamba-cache-mode align`: see [Prefix caching](#prefix-caching). Makes repeat
-  turns of an agent loop nearly free, for about 7% of the KV cache and ~15% of decode speed here; drop it for
-  one-off long generations.
+  turns of an agent loop nearly free, for about 7% of the KV cache. With MTP, decode costs nothing measurable
+  since 0.6.5 (it was ~15% before); see [Prefix caching](#prefix-caching).
 * `--gpu-memory-utilization 0.88` leaves room for a desktop on the GPU that drives the display.
 * Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the environment (less fragmentation).
 
@@ -270,6 +270,7 @@ Nothing is required. Optional environment variables:
 | `QWEN_MLA_SPLITK_SCRATCH_MB` | `512` | cap on the Triton decode's split-K scratch; fewer key splits at very large batch x context |
 | `QWEN_MLA_GLA_SHARD` | `1` | `0` keeps the full latent on every GPU for grouped models (A/B testing) |
 | `QWEN_MLA_ALIGN_FREE` | `1` | `0` keeps vLLM's linear-attention state blocks for a whole prefill under `--mamba-cache-mode align` (see [Prefix caching](#prefix-caching)) |
+| `QWEN_MLA_GDN_META_CACHE` | on with MTP + `--mamba-cache-mode align` | build the linear-attention metadata once per step instead of once per layer (see [Prefix caching](#prefix-caching)); `1` forces it on, `0` off |
 | `QWEN_MLA_PREFILL_WS_ROWS` | 1024 per GiB of GPU memory, max 64k | context rows per long-prompt prefill chunk; scratch is ~30 KB per row |
 | `QWEN_MLA_MTP_DRAFT_BACKEND` | Triton with an FP8 cache (not Hopper) | attention backend of the MTP draft layer; `auto` leaves it to vLLM (see [MTP](#speculative-decoding-mtp)) |
 | `QWEN_MLA_CACHE` | `~/.cache/qwen-mla` | where the kernel overlay and compiled modules live |
@@ -345,10 +346,24 @@ on a 1600-token block prefills 1600 per step. The block size depends on the KV d
 (1600 on two GPUs with FP8 KV and MTP, 1568 without MTP); the worker log prints it (`Setting attention block
 size to N tokens`), and the plugin warns at startup when the budget is not a multiple.
 
-The cost is decode speed: align mode updates the linear-attention state bookkeeping every step. With MTP
-k=3 on 2x RTX 5060 Ti, six greedy prompts averaged 67.5 tok/s with prefix caching and 78.8 without, and
-decode at 7k context ran 45 vs 55 tok/s. It pays off whenever prompts repeat (agent loops, chat, a long
-system prompt); for single long generations from fresh prompts, leave it off.
+Decode speed: with MTP, align mode waits for each step's accepted-token counts before preparing the next
+step, so host-side work stops overlapping the GPU. vLLM builds the linear-attention metadata once per KV-cache
+group, and GLA-g2's single 1792-latent layer makes every layer its own group (vLLM sizes groups by the
+smallest set of same-spec layers): 48 builds per step. Before 0.6.5
+that cost about 15% of decode (2x RTX 5060 Ti, MTP k=3: GPUs 63% busy vs 95% without prefix caching). The
+plugin now builds it once per step and gives each layer only its own state indices
+(`QWEN_MLA_GDN_META_CACHE`). Measured there, decode tok/s at 1 / 2 / 3 / 4 concurrent requests:
+
+| MTP k=3 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| prefix caching, 0.6.3 | 57 | 96-103 | 135-137 | 153-156 |
+| prefix caching, 0.6.5 | 67-68 | 115-120 | 158-159 | 168-169 |
+| no prefix caching | 66-69 | 111-126 | 146-161 | 169-194 |
+
+It is on only with MTP and align mode, the combination it was measured to help: without MTP it measured about
+5% slower (within run-to-run noise, but at every concurrency), and without prefix caching the host work
+already overlaps the GPU. Without MTP, prefix caching's decode cost has not been re-measured. Prefix caching
+pays off whenever prompts repeat (agent loops, chat, a long system prompt).
 
 ## Limitations
 
