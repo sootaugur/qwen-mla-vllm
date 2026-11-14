@@ -47,7 +47,7 @@ vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-p
 * Tool calling (agent harnesses): `--enable-auto-tool-choice --tool-call-parser qwen3_coder`.
 * Agent loops, chat, or a long shared system prompt: add `--enable-prefix-caching --mamba-cache-mode align`
   so repeated prefixes are not prefilled again (a 37.7k-token second turn: 52 s -> 0.6 s to first token).
-  Costs ~7% of KV capacity and ~15% of decode speed (measured on 2x RTX 5060 Ti). Give `--max-num-batched-tokens` a multiple of
+  Costs ~7% of KV capacity; with MTP, no measurable decode speed since 0.6.5 (measured on 2x RTX 5060 Ti). Give `--max-num-batched-tokens` a multiple of
   the cache block, which varies with KV dtype, TP size and MTP (1600 on 2 GPUs, FP8 KV, MTP); if it is not, the plugin prints
   `[qwen-mla] prefix caching: prefill chunks are multiples of ...` with the values to use. Do not set `--prefix-match-unit`;
   the plugin picks it.
