@@ -227,6 +227,8 @@ def register():
     patch_mamba_align_free()
     from .gdn_meta_cache import patch_gdn_metadata_cache
     patch_gdn_metadata_cache()
+    from .lora_exl3 import patch_lora_on_exl3
+    patch_lora_on_exl3()
 
 
 def _profile_prefill_context_scratch():

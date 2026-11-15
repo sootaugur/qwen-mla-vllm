@@ -85,6 +85,9 @@ default, no MTP): about 106k tokens of KV at 32k max context, measured under an 
 Vision and MTP need more memory than a 24 GB card leaves. The INT4 builds fit a 32 GB card text-only
 (about 250k tokens of KV at 32k context).
 
+LoRA adapters (`--enable-lora`) work on the EXL3 builds: the adapter runs in bf16 on top of the
+quantized layers.
+
 ## 16 GB GPUs
 
 Two 16 GB GeForce cards (tested: 2x RTX 5060 Ti, PCIe, no NVLink) serve the grouped EXL3 build at the
