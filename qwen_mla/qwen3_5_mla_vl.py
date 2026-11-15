@@ -26,6 +26,8 @@ from .qwen3_5_mla import Qwen3_5MLAForCausalLM
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class Qwen3_5MLAForConditionalGeneration(Qwen3_5ForConditionalGeneration):
+    embedding_modules = {"lm_head": "output_embeddings"}   # LoRA on the output head
+
     def __init__(self, *, vllm_config, prefix: str = "model"):
         # The parent constructs `Qwen3_5ForCausalLM` by module-global name; substitute ours for the
         # duration of its __init__ so everything else (vision tower, processors, M-RoPE positions,

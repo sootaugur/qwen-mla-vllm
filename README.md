@@ -85,8 +85,7 @@ default, no MTP): about 106k tokens of KV at 32k max context, measured under an 
 Vision and MTP need more memory than a 24 GB card leaves. The INT4 builds fit a 32 GB card text-only
 (about 250k tokens of KV at 32k context).
 
-LoRA adapters (`--enable-lora`) work on the EXL3 builds: the adapter runs in bf16 on top of the
-quantized layers.
+LoRA adapters work on the EXL3 builds; see [LoRA adapters](#lora-adapters).
 
 ## 16 GB GPUs
 
@@ -367,6 +366,40 @@ It is on only with MTP and align mode, the combination it was measured to help: 
 5% slower (within run-to-run noise, but at every concurrency), and without prefix caching the host work
 already overlaps the GPU. Without MTP, prefix caching's decode cost has not been re-measured. Prefix caching
 pays off whenever prompts repeat (agent loops, chat, a long system prompt).
+
+## LoRA adapters
+
+Adapters trained on the base Qwen3.8-27B load with `--enable-lora` (tested on the EXL3 builds, where the adapter
+runs in bf16 on top of the quantized layers). The retrofit keeps every base weight an
+adapter usually targets -- q_proj, o_proj, the linear-attention and MLP projections, lm_head (adapters that
+train a decision head there are applied) -- except self_attn.k_proj / v_proj, which the latent replaces. vLLM
+refuses an adapter that still names them, so fold them in first:
+
+```bash
+python scripts/fold_lora_kv.py --adapter <PEFT adapter dir> --model <MLA/GLA checkpoint dir> --out <dir>
+```
+
+The rope rows of the key delta become a LoRA on `k_rope_proj` (exact); the rest of the key and value delta
+becomes a LoRA on `kv_a_proj`, the per-token least-squares fit through the fixed up-projections, so it rides in
+the cached latent and the KV compression is unchanged. That LoRA's rank is the k and v ranks added (32 for a
+rank-16 adapter); the script prints the `--max-lora-rank` the result needs.
+
+Measured with [autotrust/AutoTrust-Decider-Pro-Vision-27B](https://huggingface.co/autotrust/AutoTrust-Decider-Pro-Vision-27B)'s
+decision adapter on 2x RTX 5060 Ti, zero-shot intent classification with 64 options (400 utterances each):
+
+| | BANKING77 | CLINC150 | log-loss |
+|---|---:|---:|---:|
+| base EXL3 build + original adapter | 76.2% | 92.7% | 1.236 / 0.509 |
+| GLA-g2-EXL3 + folded adapter | 76.0% | 92.7% | 1.236 / 0.510 |
+| GLA-g2-EXL3, k_proj/v_proj dropped instead | 75.7% | 92.5% | 1.226 / 0.490 |
+| GLA-g2-EXL3, no adapter | 70.0% | 83.0% | 1.478 / 0.814 |
+
+The fold agreed with the base build's top answer on 96% / 99.5% of items. For that adapter the k/v part
+mattered little either way (dropping it on the base build moved accuracy by under half a point).
+
+Decision adapters of this kind read option-token log-probabilities in one forward pass; serve them with
+`--logprobs-mode processed_logprobs` and send `allowed_token_ids` with `top_k: 0, top_p: 1.0`, or the
+generation config's top-k / top-p truncate the distribution.
 
 ## Limitations
 

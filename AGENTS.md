@@ -107,5 +107,7 @@ The answer should contain `391`. In the server log, check for:
 | MTP decode falls off sharply at long context (2x RTX 5060 Ti, k=3: 64 tok/s at 1k, 44 at 81k) | plugin older than 0.6.3 with an FP8 cache: every draft token re-read the latent cache. Upgrade; 0.6.3 gives 55 at 81k |
 | prefix caching on: long prompts are preempted (`GPU KV cache usage` hits 100%) with far fewer tokens resident than `Maximum concurrency` at startup promised | plugin older than 0.6.4: every prefill chunk leaked linear-attention state blocks until the request finished; upgrade |
 | `ValueError: Unsupported base layer` at startup with `--enable-lora` on an EXL3 build | plugin older than 0.6.6; upgrade |
+| `While loading ..., expected target modules in [...] but received [...k_proj...]` when loading a LoRA adapter | the adapter was trained on the base model and targets k_proj/v_proj, which the MLA builds replace; fold them in with `scripts/fold_lora_kv.py` (README, LoRA adapters) |
+| an adapter that trains `lm_head` (e.g. a decision head) behaves as if that part were missing | plugin older than 0.6.7; upgrade |
 | prefix caching on but `Prefix cache hit rate` stays low across turns of one conversation | the harness changes earlier messages (timestamps, reordering) so the prefix differs; nothing to fix server-side |
 | tok/s reported by a client is about half the server log's `Avg generation throughput` with MTP | the client counts stream chunks, and MTP sends several tokens per chunk; trust the server log |

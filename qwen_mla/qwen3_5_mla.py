@@ -130,6 +130,8 @@ class Qwen3_5MLAAttention(nn.Module):
             def _load_group_rows(param, loaded_weight, *args, **kwargs):
                 param.data.copy_(loaded_weight[sl].to(param.dtype))
             self.kv_a_proj.weight.weight_loader = _load_group_rows
+            # A LoRA on kv_a_proj carries the full latent in lora_B; keep this group's rows (lora_exl3).
+            self.kv_a_proj._qwen_mla_lora_rows = sl
         self.k_rope_proj = ReplicatedLinear(config.hidden_size,
                                             self.num_kv_heads * self.rope_dim, bias=False,
                                             quant_config=quant_config,
@@ -459,6 +461,8 @@ class Qwen3_5MLAModel(Qwen3_5Model):
 
 class Qwen3_5MLAForCausalLM(Qwen3_5ForCausalLM):
     hf_to_vllm_mapper = _ABSORBED_MAPPER
+    # LoRA adapters may target the output head (vLLM wraps it as LogitsProcessorWithLoRA).
+    embedding_modules = {"lm_head": "output_embeddings"}
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         import vllm.model_executor.models.qwen3_5 as _q35
