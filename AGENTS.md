@@ -105,5 +105,6 @@ The answer should contain `391`. In the server log, check for:
 | `AssertionError` in `_apply_cow` (engine dies on a prefix-cache hit) | plugin older than 0.6.1; upgrade |
 | with MTP, an occasional prompt answers with garbage from the first token (`!!!!`, stray words) | plugin older than 0.6.1 (a final prefill chunk of exactly 1 + k tokens replayed the decode graph); upgrade |
 | MTP decode falls off sharply at long context (2x RTX 5060 Ti, k=3: 64 tok/s at 1k, 44 at 81k) | plugin older than 0.6.3 with an FP8 cache: every draft token re-read the latent cache. Upgrade; 0.6.3 gives 55 at 81k |
+| prefix caching on: long prompts are preempted (`GPU KV cache usage` hits 100%) with far fewer tokens resident than `Maximum concurrency` at startup promised | plugin older than 0.6.4: every prefill chunk leaked linear-attention state blocks until the request finished; upgrade |
 | prefix caching on but `Prefix cache hit rate` stays low across turns of one conversation | the harness changes earlier messages (timestamps, reordering) so the prefix differs; nothing to fix server-side |
 | tok/s reported by a client is about half the server log's `Avg generation throughput` with MTP | the client counts stream chunks, and MTP sends several tokens per chunk; trust the server log |

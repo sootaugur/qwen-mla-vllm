@@ -223,6 +223,8 @@ def register():
     _fp8_kv_default_from_checkpoint()
     _prefix_cache_hit_granularity()
     _prefix_cache_scheduler_fixes()
+    from .mamba_align_free import patch_mamba_align_free
+    patch_mamba_align_free()
 
 
 def _profile_prefill_context_scratch():

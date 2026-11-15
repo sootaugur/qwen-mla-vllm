@@ -269,6 +269,7 @@ Nothing is required. Optional environment variables:
 | `QWEN_MLA_FP8_RMS` | `log8` | FP8 cache: format of the per-head score divisor (`log8`, `bf16` = wider rows and no MTP, `e4m3`) |
 | `QWEN_MLA_SPLITK_SCRATCH_MB` | `512` | cap on the Triton decode's split-K scratch; fewer key splits at very large batch x context |
 | `QWEN_MLA_GLA_SHARD` | `1` | `0` keeps the full latent on every GPU for grouped models (A/B testing) |
+| `QWEN_MLA_ALIGN_FREE` | `1` | `0` keeps vLLM's linear-attention state blocks for a whole prefill under `--mamba-cache-mode align` (see [Prefix caching](#prefix-caching)) |
 | `QWEN_MLA_PREFILL_WS_ROWS` | 1024 per GiB of GPU memory, max 64k | context rows per long-prompt prefill chunk; scratch is ~30 KB per row |
 | `QWEN_MLA_MTP_DRAFT_BACKEND` | Triton with an FP8 cache (not Hopper) | attention backend of the MTP draft layer; `auto` leaves it to vLLM (see [MTP](#speculative-decoding-mtp)) |
 | `QWEN_MLA_CACHE` | `~/.cache/qwen-mla` | where the kernel overlay and compiled modules live |
@@ -311,7 +312,7 @@ python tests/test_mrope.py          # CPU only
 `--enable-prefix-caching --mamba-cache-mode align` reuses the KV cache and linear-attention state of a
 prompt prefix that an earlier request already computed: the system prompt, and in an agent loop or chat,
 everything up to the newest message. vLLM marks this mode experimental for hybrid models. The plugin fixes
-three problems vLLM 0.27.1 has with it on these architectures (all automatic):
+four problems vLLM 0.27.1 has with it on these architectures (all automatic):
 
 * GLA-g2's MLA layers come in three latent widths, which vLLM gives different block sizes (1x, 2x, 4x the
   cache block). Hits were rounded down to the largest, so a 16k-token second turn reused only 12.5k tokens.
@@ -321,6 +322,12 @@ three problems vLLM 0.27.1 has with it on these architectures (all automatic):
   The plugin turns that off: it protects only the drafter's proposals, which the model verifies anyway.
 * With several full-attention groups and a hit shortened by the linear-attention layers, vLLM trimmed
   only one group's blocks; the next partial hit crashed the engine (`AssertionError` in `_apply_cow`).
+* During prefill vLLM kept the linear-attention state of every chunk until the request finished: each
+  step's free of the superseded state ran while that step was still in flight, failed, and was never
+  retried. On GLA-g2 that is 81 MiB per 3136-token chunk, ~2.5 GiB for a 100k prompt, three times its
+  KV cache. With 4 x 100k-token prompts on 2x RTX 5060 Ti the pool filled and requests were preempted
+  and prefilled again, although the startup log promised 4.1x concurrency at 131k; with the fix the same
+  load peaks at 35% of the pool. `QWEN_MLA_ALIGN_FREE=0` restores vLLM's behavior.
 
 Measured on 2x RTX 5060 Ti, second turn of a two-turn conversation:
 
